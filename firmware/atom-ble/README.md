@@ -16,7 +16,8 @@ Live nodes already run a slim `atom-led` image of RuView `esp32-csi-node` **v0.8
 | LED | GPIO **35** WS2812 — faint green online, flash red offline |
 | CSI | Promiscuous, `WIFI_PS_NONE`, UDP to NVS `target_ip:target_port` (192.168.0.39:5005) |
 | OTA | `GET :8032/ota/status`, `POST :8032/ota` with `Authorization: Bearer <ota_psk>` |
-| OTA fail-closed | No PSK in NVS `security/ota_psk` → POST rejected (RuView#596) |
+| CSI mute | PSK-gated `GET/POST :8032/csi/stop` and `/csi/start`. `POST /ota` also pauses CSI+BLE immediately after auth |
+| OTA fail-closed | No PSK in NVS `security/ota_psk` → POST `/ota` and CSI-control routes rejected (RuView#596) |
 | Partitions | Same 8MB dual-OTA table as live (`partitions.csv`, app at `0x20000`) |
 | NVS | Reads existing `csi_cfg` + `security`. Does not provision/wipe keys. |
 
@@ -73,20 +74,42 @@ After a successful build, the OTA-compatible **app image** (load address `0x2000
 
 | Path | Bytes | Notes |
 |------|------:|-------|
-| `firmware/atom-ble/release/esp32-csi-node.bin` | **828352** | Committed OTA payload (≤ 900000) |
-| `firmware/atom-ble/build/esp32-csi-node.bin` | 828352 | IDF output (not committed) |
+| `firmware/atom-ble/release/esp32-csi-node.bin` | **830336** | Committed OTA payload (≤ 900000) |
+| `firmware/atom-ble/build/esp32-csi-node.bin` | 830336 | IDF output (not committed) |
 
-SHA-256: `8715241619843216799a9d4ebbd4982bda126dc50f05a253ca779e8c7c6eacdd` (see `release/SHA256SUMS.txt`). Built with ESP-IDF **v5.4.2**, version string `0.8.5-ble`.
+SHA-256: `c1e651025d6248753e527145f5c492151ab1396df9f800fa588e85634ca021b3` (see `release/SHA256SUMS.txt`). Built with ESP-IDF **v5.4.2**, version string `0.8.6-ble`.
 
-Push:
+### LAN OTA (0.8.6-ble and later)
+
+Live **0.8.4** has no CSI-pause HTTP API. CSI UDP while receiving an ~828 KB `POST /ota` saturates 2.4 GHz and the upload times out (120s / 300s). USB-flash **0.8.6-ble once**. After that, later OTAs stay on LAN and should finish in about a minute.
+
+On 0.8.6+:
+
+1. After PSK auth, `POST /ota` **immediately** pauses CSI capture/UDP and BLE scan for the write + reboot. Resume only if OTA fails before reboot.
+2. The PC should still mute the radio **before** sending the bin when `/csi/stop` exists:
 
 ```bash
+# Check: csi_control=true and csi_paused on 0.8.6+
+curl http://192.168.0.47:8032/ota/status
+
+# Mute CSI+BLE (Bearer PSK; GET or POST)
+curl -X POST "http://192.168.0.47:8032/csi/stop" \
+  -H "Authorization: Bearer <ota_psk>"
+
+# Stream the app image
 curl -X POST "http://192.168.0.47:8032/ota" \
   -H "Authorization: Bearer <ota_psk>" \
   --data-binary @firmware/atom-ble/release/esp32-csi-node.bin
 ```
 
-Check first: `curl http://192.168.0.47:8032/ota/status` — `max_size` is 921600.
+Or use the in-repo client (calls `/csi/stop` when `GET /ota/status` reports `csi_control`):
+
+```bash
+python3 firmware/atom-ble/ota_client.py 192.168.0.47 \
+  firmware/atom-ble/release/esp32-csi-node.bin --psk '<ota_psk>'
+```
+
+`GET /ota/status` includes `"csi_paused"` and `"csi_control":true`. `max_size` is 921600.
 
 Do **not** flash bootloader/partition table over USB unless a node is already bricked. OTA only writes the app slot.
 

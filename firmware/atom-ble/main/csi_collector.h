@@ -136,4 +136,16 @@ uint16_t csi_collector_get_pkt_yield_per_sec(void);
  */
 uint16_t csi_collector_get_send_fail_count(void);
 
+/**
+ * Pause CSI capture, promiscuous RX, self-ping OFDM source, hop timer,
+ * and CSI UDP. Call before LAN OTA so the 2.4 GHz radio can accept the
+ * HTTP body. Safe to call more than once.
+ */
+void csi_collector_pause(void);
+
+/** Undo csi_collector_pause(). No-op if not paused. */
+void csi_collector_resume(void);
+
+bool csi_collector_is_paused(void);
+
 #endif /* CSI_COLLECTOR_H */

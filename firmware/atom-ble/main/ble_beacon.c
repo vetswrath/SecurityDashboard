@@ -77,6 +77,7 @@ static uint8_t s_allow_mac_count;
 static uint16_t s_allow_major[BLE_ALLOW_MM_MAX];
 static uint16_t s_allow_minor[BLE_ALLOW_MM_MAX];
 static uint8_t s_allow_mm_count;
+static volatile bool s_scan_paused;
 
 static void load_allow_list(void)
 {
@@ -237,6 +238,13 @@ static void scan_task(void *arg)
              CONFIG_BLE_SCAN_WINDOW_MS, CONFIG_BLE_SCAN_PERIOD_MS);
     const int idle_ms = CONFIG_BLE_SCAN_PERIOD_MS - CONFIG_BLE_SCAN_WINDOW_MS;
     while (1) {
+        if (s_scan_paused) {
+            if (ble_gap_disc_active()) {
+                ble_gap_disc_cancel();
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
         start_scan_window();
         vTaskDelay(pdMS_TO_TICKS(CONFIG_BLE_SCAN_WINDOW_MS + 20));
         if (ble_gap_disc_active()) {
@@ -246,6 +254,26 @@ static void scan_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(idle_ms));
         }
     }
+}
+
+void ble_beacon_pause(void)
+{
+    s_scan_paused = true;
+    if (s_nimble_synced && ble_gap_disc_active()) {
+        ble_gap_disc_cancel();
+    }
+    ESP_LOGW(TAG, "BLE scan paused");
+}
+
+void ble_beacon_resume(void)
+{
+    s_scan_paused = false;
+    ESP_LOGI(TAG, "BLE scan resumed");
+}
+
+bool ble_beacon_is_paused(void)
+{
+    return s_scan_paused;
 }
 
 static void on_sync(void)

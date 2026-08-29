@@ -2,8 +2,11 @@
  * @file ota_update.h
  * @brief HTTP OTA firmware update endpoint for ESP32-S3 CSI Node.
  *
- * Provides an HTTP server endpoint that accepts firmware binaries
- * for over-the-air updates without physical access to the device.
+ * HTTP on port 8032:
+ *   GET  /ota/status      — version, partitions, max_size, csi_paused, csi_control
+ *   POST /ota             — app image (Bearer PSK). Pauses CSI+BLE after auth.
+ *   GET/POST /csi/stop    — pause CSI UDP + BLE scan (Bearer PSK)
+ *   GET/POST /csi/start   — resume (Bearer PSK). OTA success reboots instead.
  */
 
 #ifndef OTA_UPDATE_H

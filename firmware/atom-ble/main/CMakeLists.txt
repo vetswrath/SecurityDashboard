@@ -10,6 +10,7 @@ set(SRCS
     "ble_ibeacon.c"
     "edge_processing_stub.c"
     "c6_sync_espnow_stub.c"
+    "radio_hold.c"
 )
 
 set(REQUIRES

@@ -57,6 +57,10 @@ static bool    s_filter_mac_set = false;
 
 static const char *TAG = "csi_collector";
 
+/* OTA / /csi/stop: drop CSI work immediately, then tear down radio sources. */
+static volatile bool s_paused;
+static bool s_data_capture;
+
 static uint32_t s_sequence = 0;
 static uint32_t s_cb_count = 0;
 static uint32_t s_send_ok = 0;
@@ -249,6 +253,9 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf
 static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
 {
     (void)ctx;
+    if (s_paused) {
+        return;
+    }
 
     /* Early rate gate: drop excess callbacks to ~50 Hz to prevent
      * SPI flash cache crash in WiFi ISR (wDev_ProcessFiq). */
@@ -705,6 +712,9 @@ void csi_hop_next_channel(void)
 static void hop_timer_cb(void *arg)
 {
     (void)arg;
+    if (s_paused) {
+        return;
+    }
     csi_hop_next_channel();
 }
 
@@ -714,15 +724,62 @@ void csi_collector_enable_data_capture(void)
      * (RuView#521/#893): beacons alone are sparse, yield collapses to 0 pps.
      * Without a display there is no QSPI/SPI-flash cache contention with the
      * DATA-frame interrupt load, so capture DATA frames too. */
+    if (s_paused) {
+        s_data_capture = true;
+        ESP_LOGI(TAG, "DATA capture armed; radio is paused — will apply on resume");
+        return;
+    }
     wifi_promiscuous_filter_t filt = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA,
     };
     esp_err_t err = esp_wifi_set_promiscuous_filter(&filt);
     if (err == ESP_OK) {
+        s_data_capture = true;
         ESP_LOGI(TAG, "CSI filter upgraded to MGMT+DATA (no display, RuView#893)");
     } else {
         ESP_LOGW(TAG, "Failed to enable DATA-frame CSI capture: %s", esp_err_to_name(err));
     }
+}
+
+void csi_collector_pause(void)
+{
+    s_paused = true;
+    if (s_self_ping != NULL) {
+        esp_ping_stop(s_self_ping);
+    }
+    if (s_hop_timer != NULL) {
+        esp_timer_stop(s_hop_timer);
+    }
+    (void)esp_wifi_set_csi(false);
+    (void)esp_wifi_set_promiscuous(false);
+    ESP_LOGW(TAG, "CSI capture+UDP paused (self-ping off, promiscuous off)");
+}
+
+void csi_collector_resume(void)
+{
+    (void)esp_wifi_set_promiscuous(true);
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = s_data_capture
+            ? (WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA)
+            : WIFI_PROMIS_FILTER_MASK_MGMT,
+    };
+    (void)esp_wifi_set_promiscuous_filter(&filt);
+    (void)esp_wifi_set_csi(true);
+    if (s_self_ping != NULL) {
+        esp_ping_start(s_self_ping);
+    } else {
+        csi_start_self_ping();
+    }
+    if (s_hop_timer != NULL && s_hop_count > 1) {
+        (void)esp_timer_start_periodic(s_hop_timer, (uint64_t)s_dwell_ms * 1000ULL);
+    }
+    s_paused = false;
+    ESP_LOGI(TAG, "CSI capture+UDP resumed");
+}
+
+bool csi_collector_is_paused(void)
+{
+    return s_paused;
 }
 
 void csi_collector_start_hop_timer(void)

@@ -19,6 +19,9 @@
 #include "esp_app_desc.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "radio_hold.h"
+#include "esp_timer.h"
+#include "lwip/sockets.h"
 
 static const char *TAG = "ota_update";
 
@@ -93,15 +96,16 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
 
-    char response[512];
+    char response[640];
     int len = snprintf(response, sizeof(response),
         "{\"version\":\"%s\",\"date\":\"%s\",\"time\":\"%s\","
         "\"running_partition\":\"%s\",\"next_partition\":\"%s\","
-        "\"max_size\":%d}",
+        "\"max_size\":%d,\"csi_paused\":%s,\"csi_control\":true}",
         app->version, app->date, app->time,
         running ? running->label : "unknown",
         update ? update->label : "none",
-        OTA_MAX_SIZE);
+        OTA_MAX_SIZE,
+        radio_hold_is_paused() ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, response, len);
@@ -121,9 +125,20 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "OTA update started, content_length=%d", req->content_len);
+    /* Pause CSI UDP + BLE immediately so the 2.4 GHz radio can accept
+     * the ~828 KB body. Live 0.8.4 timed out because CSI stayed on. */
+    radio_hold_pause("POST /ota");
+    {
+        int sock = httpd_req_to_sockfd(req);
+        if (sock >= 0) {
+            int rcvbuf = 16 * 1024;
+            (void)setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        }
+    }
+    ESP_LOGI(TAG, "OTA update started, content_length=%d (CSI+BLE paused)", req->content_len);
 
     if (req->content_len <= 0 || req->content_len > OTA_MAX_SIZE) {
+        radio_hold_resume();
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                             "Invalid firmware size (must be 1B - 900KB)");
         return ESP_FAIL;
@@ -131,6 +146,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
     if (update_partition == NULL) {
+        radio_hold_resume();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "No OTA partition available");
         return ESP_FAIL;
@@ -140,24 +156,35 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     esp_err_t err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        radio_hold_resume();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "OTA begin failed");
         return ESP_FAIL;
     }
 
-    /* Read firmware in chunks. */
-    char buf[1024];
+    /* Stream flash writes as the body arrives — do not buffer the image. */
+    char buf[4096];
     int received = 0;
     int total = 0;
+    const int64_t deadline_us = esp_timer_get_time() + 90LL * 1000 * 1000;
 
     while (total < req->content_len) {
         received = httpd_req_recv(req, buf, sizeof(buf));
         if (received <= 0) {
             if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                if (esp_timer_get_time() > deadline_us) {
+                    ESP_LOGE(TAG, "OTA receive deadline (90s) at byte %d", total);
+                    esp_ota_abort(ota_handle);
+                    radio_hold_resume();
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                        "Receive timeout");
+                    return ESP_FAIL;
+                }
                 continue;  /* Retry on timeout. */
             }
             ESP_LOGE(TAG, "OTA receive error at byte %d", total);
             esp_ota_abort(ota_handle);
+            radio_hold_resume();
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                                 "Receive error");
             return ESP_FAIL;
@@ -168,6 +195,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             ESP_LOGE(TAG, "esp_ota_write failed at byte %d: %s",
                      total, esp_err_to_name(err));
             esp_ota_abort(ota_handle);
+            radio_hold_resume();
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                                 "OTA write failed");
             return ESP_FAIL;
@@ -184,6 +212,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     err = esp_ota_end(ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        radio_hold_resume();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "OTA validation failed");
         return ESP_FAIL;
@@ -192,6 +221,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     err = esp_ota_set_boot_partition(update_partition);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        radio_hold_resume();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "Set boot partition failed");
         return ESP_FAIL;
@@ -211,14 +241,56 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     return ESP_OK;  /* Never reached. */
 }
 
+static esp_err_t csi_stop_handler(httpd_req_t *req)
+{
+    if (!ota_check_auth(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                            "Authentication required. Use: Authorization: Bearer <psk>");
+        return ESP_FAIL;
+    }
+    radio_hold_pause("GET/POST /csi/stop");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"csi_paused\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t csi_start_handler(httpd_req_t *req)
+{
+    if (!ota_check_auth(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                            "Authentication required. Use: Authorization: Bearer <psk>");
+        return ESP_FAIL;
+    }
+    radio_hold_resume();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"csi_paused\":false}");
+    return ESP_OK;
+}
+
+static void register_csi_ctrl(httpd_handle_t server, httpd_method_t method,
+                              const char *uri, esp_err_t (*handler)(httpd_req_t *))
+{
+    httpd_uri_t u = {
+        .uri = uri,
+        .method = method,
+        .handler = handler,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &u);
+}
+
 /** Internal: start the HTTP server and register OTA endpoints. */
 static esp_err_t ota_start_server(httpd_handle_t *out_handle)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = OTA_PORT;
-    config.max_uri_handlers = 12;  /* Extra slots for WASM endpoints (ADR-040). */
-    /* Increase receive timeout for large uploads. */
-    config.recv_wait_timeout = 30;
+    config.max_uri_handlers = 16;
+    /* High-priority HTTP so CSI cannot starve the OTA socket. */
+    config.task_priority = 10;
+    config.stack_size = 8192;
+    config.recv_wait_timeout = 60;
+    config.send_wait_timeout = 30;
+    config.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;
     esp_err_t err = httpd_start(&server, &config);
@@ -245,9 +317,16 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
     };
     httpd_register_uri_handler(server, &upload_uri);
 
+    register_csi_ctrl(server, HTTP_GET, "/csi/stop", csi_stop_handler);
+    register_csi_ctrl(server, HTTP_POST, "/csi/stop", csi_stop_handler);
+    register_csi_ctrl(server, HTTP_GET, "/csi/start", csi_start_handler);
+    register_csi_ctrl(server, HTTP_POST, "/csi/start", csi_start_handler);
+
     ESP_LOGI(TAG, "OTA HTTP server started on port %d", OTA_PORT);
-    ESP_LOGI(TAG, "  GET  /ota/status — firmware version info");
-    ESP_LOGI(TAG, "  POST /ota        — upload new firmware binary");
+    ESP_LOGI(TAG, "  GET  /ota/status — firmware version + csi_paused");
+    ESP_LOGI(TAG, "  POST /ota        — upload new firmware binary (pauses CSI)");
+    ESP_LOGI(TAG, "  GET/POST /csi/stop  — pause CSI+BLE (Bearer PSK)");
+    ESP_LOGI(TAG, "  GET/POST /csi/start — resume CSI+BLE (Bearer PSK)");
 
     if (out_handle) *out_handle = server;
     return ESP_OK;
