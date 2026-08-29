@@ -322,11 +322,12 @@ void nvs_config_load(nvs_config_t *cfg)
         cfg->swarm_ingest_sec = 5;
     }
 
-    /* Optional BLE allow-list keys (read by ble_beacon.c, same namespace):
+    /* Optional BLE keys in this namespace (read by ble_beacon.c):
      *   ble_uuid      — 16-byte blob, override Blue Charm UUID
      *   ble_allow_mac — packed 6-byte MACs
      *   ble_allow_mm  — packed {u16le major, u16le minor} pairs
-     * If unset, every iBeacon matching the Blue Charm UUID is reported.
+     *   ble_scan      — u8, written by ble_beacon (default on). /ble/stop=0
+     * If allow-list unset, every iBeacon matching the Blue Charm UUID is reported.
      * This loader never writes NVS and never erases existing keys. */
 
     /* Validate tdm_slot_index < tdm_node_count */

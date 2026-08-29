@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief AtomS3 Lite CSI node + time-sliced BLE iBeacon scan.
+ * @brief AtomS3 Lite CSI node + continuous low-duty BLE iBeacon scan.
  *
  * Slim fork of ruvnet/RuView firmware/esp32-csi-node v0.8.4:
  * CSI collector, UDP stream, NVS config, HTTP OTA, GPIO 35 LED.
@@ -172,10 +172,17 @@ void app_main(void)
             g_nvs_config.dwell_ms);
     }
 
+    /* Collar job: start NimBLE after CSI MGMT-only is running. No PSK
+     * /ble/start required. Persist ble_scan=on. Controller stays up. */
+    if (ble_ret == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        (void)ble_beacon_autostart();
+    }
+
     ESP_LOGI(TAG, "CSI MGMT-only → %s:%d (OTA=%s, BLE=%s, LED=GPIO35)",
              g_nvs_config.target_ip, g_nvs_config.target_port,
              (ota_ret == ESP_OK) ? "ready" : "off",
-             (ble_ret == ESP_OK) ? "off until /ble/start" : "init-fail");
+             (ble_ret == ESP_OK) ? "auto-scan" : "init-fail");
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));

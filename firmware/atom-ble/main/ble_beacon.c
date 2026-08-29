@@ -1,16 +1,15 @@
 /**
  * @file ble_beacon.c
- * @brief iBeacon observer — NimBLE controller OFF at boot.
+ * @brief Continuous low-duty NimBLE iBeacon observer (controller stays up).
  *
- * 0.8.5–0.8.7 all hung STA with the BLE controller up (CPU 0 stuck in
- * `wifi`, ICMP/TCP dead). Coexist knobs did not unstick the wifi blob.
+ * 0.8.8/0.8.9 sliced the radio: nimble_port_init → 80 ms scan →
+ * nimble_port_stop + deinit → 8 s off. GET /ble/beacons then showed
+ * radio_up:false and no iBeacons. 0.8.10 leaves the controller up and
+ * runs ble_gap_disc(..., BLE_HS_FOREVER, 16 ms / 100 ms).
  *
- * Exact radio change: ble_beacon_init() does not call nimble_port_init().
- * The BLE controller is not started, so it cannot take the 2.4 GHz radio
- * or block the wifi task. /ble/start (PSK) opts in. Each slice:
- *   nimble_port_init → ~80 ms scan → nimble_port_stop + deinit
- * then 8 s of Wi-Fi-only. Wi-Fi TX fail or OTA hold tears the controller
- * down immediately and leaves it off (TX fail clears the enable flag).
+ * Software coexist stays OFF (those Kconfig flags hung 0.8.5–0.8.8
+ * even with BLE never started). CSI remains MGMT-only. If Wi-Fi TX
+ * fails, cancel discovery briefly — do not deinit, do not persist off.
  */
 #include "ble_beacon.h"
 #include "ble_ibeacon.h"
@@ -37,13 +36,15 @@
 
 static const char *TAG = "ble_beacon";
 
-#define BLE_SLICE_ON_MS     80
-#define BLE_SLICE_OFF_MS    8000
 #define BLE_WIFI_FAIL_THRESH 4
+#define BLE_TX_BACKOFF_US    (250000LL)
 
 #define BLE_SIGHTING_MAX      8
 #define BLE_ALLOW_MAC_MAX     8
 #define BLE_ALLOW_MM_MAX      8
+
+#define NVS_NS_CSI            "csi_cfg"
+#define NVS_KEY_BLE_SCAN      "ble_scan"
 
 extern nvs_config_t g_nvs_config;
 
@@ -79,6 +80,7 @@ static volatile bool s_nimble_synced;
 static uint8_t s_own_addr_type;
 static QueueHandle_t s_udp_q;
 static volatile uint32_t s_wifi_fail_streak;
+static volatile int64_t s_scan_backoff_us;
 
 static uint8_t s_filter_uuid[16] = { BLE_BLUECHARM_UUID_BYTES };
 static uint8_t s_allow_mac[BLE_ALLOW_MAC_MAX][6];
@@ -87,17 +89,99 @@ static uint16_t s_allow_major[BLE_ALLOW_MM_MAX];
 static uint16_t s_allow_minor[BLE_ALLOW_MM_MAX];
 static uint8_t s_allow_mm_count;
 
-/* User asked for scan (/ble/start). Default false — boot never enables this. */
+/* NVS ble_scan (default on). /ble/stop persists off. */
 static volatile bool s_user_enabled;
-/* OTA /csi/stop hold — keep controller down even if user_enabled. */
+/* OTA /csi/stop hold — cancel scan, leave controller initialized. */
 static volatile bool s_hold;
 /* nimble_port_init has been called and not yet deinit'd. */
 static volatile bool s_controller_up;
+/* ble_gap_disc(..., FOREVER) is running. */
+static volatile bool s_scan_active;
+
+static int clamp_scan_ms(int ms, int lo, int hi)
+{
+    if (ms < lo) {
+        return lo;
+    }
+    if (ms > hi) {
+        return hi;
+    }
+    return ms;
+}
+
+static int scan_window_ms(void)
+{
+    return clamp_scan_ms(CONFIG_BLE_SCAN_WINDOW_MS, 8, 24);
+}
+
+static int scan_period_ms(void)
+{
+    int period = clamp_scan_ms(CONFIG_BLE_SCAN_PERIOD_MS, 80, 200);
+    int window = scan_window_ms();
+    if (window >= period) {
+        period = window * 6;
+        if (period < 80) {
+            period = 80;
+        }
+        if (period > 200) {
+            period = 200;
+        }
+    }
+    return period;
+}
+
+/* NimBLE itvl/window unit is 0.625 ms. */
+static uint16_t ms_to_slots(int ms)
+{
+    int slots = (ms * 8 + 2) / 5;
+    if (slots < 16) {
+        slots = 16;
+    }
+    if (slots > 0xFFFF) {
+        slots = 0xFFFF;
+    }
+    return (uint16_t)slots;
+}
+
+static void persist_ble_scan(uint8_t on)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NS_CSI, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGW(TAG, "NVS open failed — cannot persist ble_scan");
+        return;
+    }
+    uint8_t cur = 0xFF;
+    if (nvs_get_u8(nvs, NVS_KEY_BLE_SCAN, &cur) == ESP_OK && cur == on) {
+        nvs_close(nvs);
+        return;
+    }
+    if (nvs_set_u8(nvs, NVS_KEY_BLE_SCAN, on) == ESP_OK) {
+        (void)nvs_commit(nvs);
+        ESP_LOGI(TAG, "NVS %s/%s=%u", NVS_NS_CSI, NVS_KEY_BLE_SCAN, (unsigned)on);
+    } else {
+        ESP_LOGW(TAG, "NVS set %s failed", NVS_KEY_BLE_SCAN);
+    }
+    nvs_close(nvs);
+}
+
+static bool nvs_ble_scan_wanted(void)
+{
+    nvs_handle_t nvs;
+    uint8_t v = 1; /* default ON — collar job, no /ble/start required */
+    if (nvs_open(NVS_NS_CSI, NVS_READONLY, &nvs) == ESP_OK) {
+        uint8_t stored;
+        if (nvs_get_u8(nvs, NVS_KEY_BLE_SCAN, &stored) == ESP_OK) {
+            v = stored;
+        }
+        nvs_close(nvs);
+    }
+    return v != 0;
+}
 
 static void load_allow_list(void)
 {
     nvs_handle_t nvs;
-    if (nvs_open("csi_cfg", NVS_READONLY, &nvs) != ESP_OK) {
+    if (nvs_open(NVS_NS_CSI, NVS_READONLY, &nvs) != ESP_OK) {
         ESP_LOGI(TAG, "No csi_cfg NVS — report all Blue Charm UUID iBeacons");
         return;
     }
@@ -212,6 +296,10 @@ static void record_sighting(const uint8_t mac[6], const ble_ibeacon_t *ib, int8_
 static int gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
+    if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
+        s_scan_active = false;
+        return 0;
+    }
     if (event->type != BLE_GAP_EVENT_DISC) {
         return 0;
     }
@@ -245,6 +333,7 @@ static void on_sync(void)
 static void on_reset(int reason)
 {
     s_nimble_synced = false;
+    s_scan_active = false;
     ESP_LOGW(TAG, "NimBLE reset, reason=%d", reason);
 }
 
@@ -255,15 +344,22 @@ static void nimble_host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
-static void controller_down(void)
+static void cancel_scan(void)
 {
-    if (!s_controller_up) {
-        return;
-    }
-    ESP_LOGW(TAG, "stopping NimBLE controller (wifi-only radio)");
     if (s_nimble_synced && ble_gap_disc_active()) {
         ble_gap_disc_cancel();
     }
+    s_scan_active = false;
+}
+
+static void controller_down(void)
+{
+    if (!s_controller_up) {
+        s_scan_active = false;
+        return;
+    }
+    ESP_LOGW(TAG, "stopping NimBLE controller");
+    cancel_scan();
     (void)nimble_port_stop();
     (void)nimble_port_deinit();
     s_nimble_synced = false;
@@ -298,18 +394,38 @@ static esp_err_t controller_up(void)
     return ESP_OK;
 }
 
-static int start_slice_scan(void)
+static int start_low_duty_scan(void)
 {
+    if (!s_nimble_synced) {
+        return BLE_HS_EDISABLED;
+    }
+    if (ble_gap_disc_active()) {
+        s_scan_active = true;
+        return 0;
+    }
+
+    int window_ms = scan_window_ms();
+    int period_ms = scan_period_ms();
     struct ble_gap_disc_params params = {0};
-    params.itvl = 160;    /* 100 ms */
-    params.window = 32;   /* 20 ms inside the 80 ms slice */
+    params.itvl = ms_to_slots(period_ms);
+    params.window = ms_to_slots(window_ms);
+    if (params.window >= params.itvl) {
+        params.window = params.itvl / 6;
+        if (params.window < 16) {
+            params.window = 16;
+        }
+    }
     params.passive = 1;
-    params.filter_duplicates = 1;
-    int rc = ble_gap_disc(s_own_addr_type, BLE_SLICE_ON_MS, &params, gap_event, NULL);
+    params.filter_duplicates = 0;
+    int rc = ble_gap_disc(s_own_addr_type, BLE_HS_FOREVER, &params, gap_event, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         ESP_LOGW(TAG, "ble_gap_disc rc=%d", rc);
+        s_scan_active = false;
         return rc;
     }
+    s_scan_active = true;
+    ESP_LOGI(TAG, "continuous scan window=%dms itvl=%dms (slots %u/%u) — controller stays up",
+             window_ms, period_ms, (unsigned)params.window, (unsigned)params.itvl);
     return 0;
 }
 
@@ -323,49 +439,58 @@ static void ble_udp_task(void *arg)
 }
 
 /*
- * Hard radio schedule: controller is fully deinitialized except for an
- * ~80 ms scan slice. This is not a coexist knob — the BLE MAC is off.
+ * Keep the controller initialized and the discovery procedure running.
+ * Never start/stop/deinit on a timer. OTA hold cancels scan only.
  */
-static void slice_task(void *arg)
+static void scan_keep_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "BLE default OFF — NimBLE controller not started (STA first)");
+    ESP_LOGI(TAG, "BLE keep-alive — wait for autostart (controller not up yet)");
     while (1) {
-        if (!s_user_enabled || s_hold) {
-            if (xSemaphoreTake(s_radio_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (!s_user_enabled) {
+            if (s_radio_lock && xSemaphoreTake(s_radio_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
                 controller_down();
                 xSemaphoreGive(s_radio_lock);
             }
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
-
-        if (xSemaphoreTake(s_radio_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        if (s_hold) {
+            if (s_radio_lock && xSemaphoreTake(s_radio_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+                cancel_scan();
+                xSemaphoreGive(s_radio_lock);
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
-        if (!s_user_enabled || s_hold) {
+        if (esp_timer_get_time() < s_scan_backoff_us) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        if (s_radio_lock == NULL || xSemaphoreTake(s_radio_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+            continue;
+        }
+        if (!s_user_enabled) {
             controller_down();
+            xSemaphoreGive(s_radio_lock);
+            continue;
+        }
+        if (s_hold) {
+            cancel_scan();
             xSemaphoreGive(s_radio_lock);
             continue;
         }
         esp_err_t err = controller_up();
         if (err == ESP_OK) {
-            (void)start_slice_scan();
+            (void)start_low_duty_scan();
             xSemaphoreGive(s_radio_lock);
-            vTaskDelay(pdMS_TO_TICKS(BLE_SLICE_ON_MS + 40));
-            if (xSemaphoreTake(s_radio_lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                controller_down();
-                xSemaphoreGive(s_radio_lock);
-            }
         } else {
-            s_user_enabled = false;
-            controller_down();
             xSemaphoreGive(s_radio_lock);
-            ESP_LOGE(TAG, "BLE controller start failed — leaving BLE off");
+            ESP_LOGE(TAG, "NimBLE controller start failed — retry (scan stays requested)");
+            vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
-        /* Wi-Fi-only for several seconds so ICMP/TCP/CSI own the radio. */
-        vTaskDelay(pdMS_TO_TICKS(BLE_SLICE_OFF_MS));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -373,21 +498,21 @@ void ble_beacon_pause(void)
 {
     s_hold = true;
     if (s_radio_lock && xSemaphoreTake(s_radio_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
-        controller_down();
+        cancel_scan();
         xSemaphoreGive(s_radio_lock);
     }
-    ESP_LOGW(TAG, "BLE hold — controller down");
+    ESP_LOGW(TAG, "BLE hold — scan cancelled, controller left initialized");
 }
 
 void ble_beacon_resume(void)
 {
     s_hold = false;
-    ESP_LOGI(TAG, "BLE hold cleared (radio stays down unless /ble/start)");
+    ESP_LOGI(TAG, "BLE hold cleared — keep-alive will resume continuous scan");
 }
 
 bool ble_beacon_is_paused(void)
 {
-    return s_hold || !s_user_enabled;
+    return s_hold;
 }
 
 esp_err_t ble_beacon_start(void)
@@ -395,19 +520,32 @@ esp_err_t ble_beacon_start(void)
     s_hold = false;
     s_user_enabled = true;
     s_wifi_fail_streak = 0;
-    ESP_LOGW(TAG, "BLE enabled — hard slice %d ms on / %d ms controller-off",
-             BLE_SLICE_ON_MS, BLE_SLICE_OFF_MS);
+    persist_ble_scan(1);
+    ESP_LOGW(TAG, "BLE enabled — continuous low-duty scan %d/%d ms, controller stays up",
+             scan_window_ms(), scan_period_ms());
     return ESP_OK;
+}
+
+esp_err_t ble_beacon_autostart(void)
+{
+    if (!nvs_ble_scan_wanted()) {
+        s_user_enabled = false;
+        persist_ble_scan(0);
+        ESP_LOGW(TAG, "NVS ble_scan=0 — observer off until /ble/start");
+        return ESP_OK;
+    }
+    return ble_beacon_start();
 }
 
 esp_err_t ble_beacon_stop(void)
 {
     s_user_enabled = false;
+    persist_ble_scan(0);
     if (s_radio_lock && xSemaphoreTake(s_radio_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
         controller_down();
         xSemaphoreGive(s_radio_lock);
     }
-    ESP_LOGW(TAG, "BLE disabled — NimBLE controller off");
+    ESP_LOGW(TAG, "BLE disabled — NimBLE controller off, NVS ble_scan=0");
     return ESP_OK;
 }
 
@@ -418,7 +556,7 @@ bool ble_beacon_is_enabled(void)
 
 bool ble_beacon_radio_is_up(void)
 {
-    return s_controller_up;
+    return s_controller_up && s_scan_active;
 }
 
 void ble_beacon_note_wifi_ok(void)
@@ -435,8 +573,13 @@ void ble_beacon_note_wifi_tx_fail(void)
     if (s_wifi_fail_streak < BLE_WIFI_FAIL_THRESH) {
         return;
     }
-    ESP_LOGE(TAG, "Wi-Fi TX failed with BLE requested — disabling BLE for this boot");
-    (void)ble_beacon_stop();
+    s_wifi_fail_streak = 0;
+    s_scan_backoff_us = esp_timer_get_time() + BLE_TX_BACKOFF_US;
+    if (s_radio_lock && xSemaphoreTake(s_radio_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        cancel_scan();
+        xSemaphoreGive(s_radio_lock);
+    }
+    ESP_LOGW(TAG, "Wi-Fi TX fail — scan paused 250ms (controller stays up, NVS stays on)");
 }
 
 static void uuid_to_str(const uint8_t u[16], char *out, size_t out_len)
@@ -457,7 +600,10 @@ static esp_err_t ble_beacons_handler(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "enabled", s_user_enabled);
-    cJSON_AddBoolToObject(root, "radio_up", s_controller_up);
+    cJSON_AddBoolToObject(root, "radio_up", ble_beacon_radio_is_up());
+    cJSON_AddStringToObject(root, "mode", "continuous");
+    cJSON_AddNumberToObject(root, "window_ms", scan_window_ms());
+    cJSON_AddNumberToObject(root, "period_ms", scan_period_ms());
     cJSON *arr = cJSON_AddArrayToObject(root, "beacons");
     if (s_lock != NULL && xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
         for (int i = 0; i < BLE_SIGHTING_MAX; i++) {
@@ -504,7 +650,7 @@ esp_err_t ble_beacon_register_http(httpd_handle_t server)
     };
     esp_err_t err = httpd_register_uri_handler(server, &uri);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "GET /ble/beacons registered (no auth); radio off until /ble/start");
+        ESP_LOGI(TAG, "GET /ble/beacons registered (no auth)");
     }
     return err;
 }
@@ -514,6 +660,7 @@ esp_err_t ble_beacon_init(void)
     s_user_enabled = false;
     s_hold = false;
     s_controller_up = false;
+    s_scan_active = false;
     s_nimble_synced = false;
 
     s_lock = xSemaphoreCreateMutex();
@@ -530,9 +677,9 @@ esp_err_t ble_beacon_init(void)
     if (xTaskCreatePinnedToCore(ble_udp_task, "ble_udp", 3072, NULL, 4, NULL, 1) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreatePinnedToCore(slice_task, "ble_slice", 4096, NULL, 4, NULL, 1) != pdPASS) {
+    if (xTaskCreatePinnedToCore(scan_keep_task, "ble_scan", 4096, NULL, 4, NULL, 1) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "BLE ready but OFF — no nimble_port_init() at boot");
+    ESP_LOGI(TAG, "BLE ready — controller deferred until autostart after CSI");
     return ESP_OK;
 }

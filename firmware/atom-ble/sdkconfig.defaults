@@ -37,6 +37,7 @@ CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
 # Live 0.8.4 atom-led has NO BT software coexist in the wifi driver.
 # 0.8.5–0.8.8 compiled SW coexist into wifi even with NimBLE unstarted;
 # CPU 0 then blocked in `wifi`. Keep coexist off so STA matches 0.8.4.
+# 0.8.10 runs NimBLE without these flags (low-duty continuous scan).
 # CONFIG_SW_COEXIST_ENABLE is not set
 # CONFIG_ESP_COEX_SW_COEXIST_ENABLE is not set
 # CONFIG_ESP_WIFI_SW_COEXIST_ENABLE is not set

@@ -361,8 +361,8 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
     ESP_LOGI(TAG, "  POST /ota        — upload new firmware binary (pauses CSI)");
     ESP_LOGI(TAG, "  GET/POST /csi/stop  — pause CSI+BLE (Bearer PSK)");
     ESP_LOGI(TAG, "  GET/POST /csi/start — resume CSI+BLE (Bearer PSK)");
-    ESP_LOGI(TAG, "  GET/POST /ble/start — opt-in NimBLE slices (Bearer PSK)");
-    ESP_LOGI(TAG, "  GET/POST /ble/stop  — tear down NimBLE controller");
+    ESP_LOGI(TAG, "  GET/POST /ble/start — persist on + continuous scan (Bearer PSK)");
+    ESP_LOGI(TAG, "  GET/POST /ble/stop  — persist off + tear down NimBLE");
 
     if (out_handle) *out_handle = server;
     return ESP_OK;

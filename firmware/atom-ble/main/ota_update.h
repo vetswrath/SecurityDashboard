@@ -7,8 +7,8 @@
  *   POST /ota             — app image (Bearer PSK). Pauses CSI+BLE after auth.
  *   GET/POST /csi/stop    — pause CSI UDP + BLE scan (Bearer PSK)
  *   GET/POST /csi/start   — resume (Bearer PSK). OTA success reboots instead.
- *   GET/POST /ble/start   — opt-in NimBLE controller slices (Bearer PSK)
- *   GET/POST /ble/stop    — tear down NimBLE controller
+ *   GET/POST /ble/start   — persist ble_scan=on, continuous NimBLE scan (PSK)
+ *   GET/POST /ble/stop    — persist ble_scan=off, tear down NimBLE (PSK)
  */
 
 #ifndef OTA_UPDATE_H

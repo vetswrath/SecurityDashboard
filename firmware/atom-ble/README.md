@@ -1,6 +1,6 @@
 # AtomS3 Lite CSI + BLE firmware (`atom-ble`)
 
-House CSI nodes (M5Stack AtomS3 Lite, ESP32-S3, 8MB) that keep live CSI + HTTP OTA and add time-sliced BLE iBeacon scanning for Blue Charm dog-collar tags.
+House CSI nodes (M5Stack AtomS3 Lite, ESP32-S3, 8MB) that keep live CSI + HTTP OTA and add continuous low-duty BLE iBeacon scanning for Blue Charm dog-collar tags.
 
 ## Why this exists
 
@@ -19,7 +19,7 @@ Live nodes already run a slim `atom-led` image of RuView `esp32-csi-node` **v0.8
 | CSI mute | PSK-gated `GET/POST :8032/csi/stop` and `/csi/start`. `POST /ota` also pauses CSI+BLE immediately after auth |
 | OTA fail-closed | No PSK in NVS `security/ota_psk` → POST `/ota` and CSI-control routes rejected (RuView#596) |
 | Partitions | Same 8MB dual-OTA table as live (`partitions.csv`, app at `0x20000`) |
-| NVS | Reads existing `csi_cfg` + `security`. Does not provision/wipe keys. |
+| NVS | Reads existing `csi_cfg` + `security`. Writes only `csi_cfg/ble_scan` (u8). Does not wipe keys. |
 
 Tonight’s OTA targets: node 1 upstairs-living `192.168.0.47`, node 2 stairs `192.168.0.49`.
 
@@ -30,31 +30,34 @@ Tonight’s OTA targets: node 1 upstairs-living `192.168.0.47`, node 2 stairs `1
 - Second dog later: Minor **4950**
 - Parse: Apple company ID `0x004C`, iBeacon type `0x02`
 
-**0.8.9-ble vs live 0.8.4 atom-led (wifi/CSI, not BLE):** 0.8.8 hung with NimBLE never started. Stairs 0.8.4 still answers. Differences this tree had that 0.8.4 does not:
+**0.8.10-ble (collar job):** After STA + HTTP `:8032` + CSI MGMT-only start, the node **auto-starts** a continuous NimBLE observer. No `/ble/start` required. `ble_scan=on` is persisted in NVS. The controller is **left up** (`ble_gap_disc(..., BLE_HS_FOREVER)` at ~16 ms window / 100 ms interval). The 0.8.9 80 ms-on / 8 s-off start/stop/deinit slice is gone — that never left `radio_up` true.
 
-1. **`csi_collector_enable_data_capture()` (MGMT+DATA, RuView#893)** — live atom-led stays **MGMT-only** (RuView#396). DATA promiscuous is documented to wedge Core 0 in `wDev_ProcessFiq` / `wifi`. **Removed from boot.**
-2. **`CONFIG_ESP_COEX_SW_COEXIST_ENABLE`** — 0.8.4 atom-led has no BT coexist in the wifi driver. This tree compiled it in even with BLE off. **Disabled.**
-3. **Boot order** — STA + `GET /ota/status` first, CSI radio off, then `csi_collector_start()` (MGMT-only). CSI callback: no `ESP_LOGI`, no `sendto`, no edge/sync work.
+**Wifi/CSI (keep 0.8.9):**
 
-BLE stays default OFF (`nimble_port_init` only on PSK `/ble/start`).
+1. **No `csi_collector_enable_data_capture()` at boot** — MGMT-only (RuView#396). DATA promiscuous wedges Core 0 in `wDev_ProcessFiq` / `wifi`.
+2. **No `CONFIG_ESP_COEX_SW_COEXIST_ENABLE` / `CONFIG_ESP_WIFI_SW_COEXIST_ENABLE` / `CONFIG_SW_COEXIST_ENABLE`.** Those hung 0.8.5–0.8.8 even with BLE off. 0.8.10 runs NimBLE without them.
+3. **Boot order** — STA + `GET /ota/status` first, CSI radio off, then `csi_collector_start()` (MGMT-only), then BLE autostart. CSI callback: no `ESP_LOGI`, no `sendto`, no edge/sync work.
 
 If NVS allow-list is unset, every iBeacon matching the Blue Charm UUID is reported.
 
-Optional read-only keys in `csi_cfg` (never written by firmware):
+Optional keys in `csi_cfg`:
 
 | Key | Type | Meaning |
 |-----|------|---------|
-| `ble_uuid` | 16-byte blob | Override filter UUID |
-| `ble_allow_mac` | packed 6-byte MACs | MAC allow-list |
-| `ble_allow_mm` | packed `{u16le major, u16le minor}` | major/minor allow-list |
+| `ble_scan` | u8 | Written by firmware. Missing or `1` = scan on (default). `/ble/stop` writes `0`. |
+| `ble_uuid` | 16-byte blob | Override filter UUID (read-only) |
+| `ble_allow_mac` | packed 6-byte MACs | MAC allow-list (read-only) |
+| `ble_allow_mm` | packed `{u16le major, u16le minor}` | major/minor allow-list (read-only) |
 
 ### LAN export
 
 `GET http://<node>:8032/ble/beacons` (no auth):
 
 ```json
-{"beacons":[{"mac":"dd:88:00:00:1f:89","uuid":"426c7565-4368-6172-6d42-6561636f6e73","major":3838,"minor":4949,"rssi":-62,"last_seen_ms":123456}]}
+{"enabled":true,"radio_up":true,"mode":"continuous","window_ms":16,"period_ms":100,"beacons":[{"mac":"dd:88:00:00:1f:89","uuid":"426c7565-4368-6172-6d42-6561636f6e73","major":3838,"minor":4949,"rssi":-62,"last_seen_ms":123456}]}
 ```
+
+After boot or OTA of this image, with **no extra `/ble/start`**: `enabled` true, `radio_up` true while scanning, nearby Blue Charm iBeacons listed. Ping to the node must stay up.
 
 UDP to `target_ip:target_port` uses magic **`0xB1E00001`** (little-endian). Existing CSI parsers that switch on `0xC511xxxx` ignore it.
 
@@ -65,6 +68,7 @@ UDP to `target_ip:target_port` uses magic **`0xB1E00001`** (little-endian). Exis
 cd firmware/atom-ble
 rm -rf build sdkconfig
 idf.py set-target esp32s3
+idf.py reconfigure
 idf.py build
 ```
 
@@ -83,11 +87,11 @@ After a successful build, the OTA-compatible **app image** (load address `0x2000
 | `firmware/atom-ble/release/esp32-csi-node.bin` | see `release/SIZE.txt` | Committed OTA payload (≤ 900000) |
 | `firmware/atom-ble/build/esp32-csi-node.bin` | same | IDF output (not committed) |
 
-Version **`0.8.9-ble`**. GitHub Release `v0.8.9-ble` (public repo).
+Version **`0.8.10-ble`**. GitHub Release `v0.8.10-ble` (public repo).
 
-### LAN OTA (0.8.6+ pause API; 0.8.7 STA-alive)
+### LAN OTA (0.8.9-ble is live upstairs)
 
-USB-flash **0.8.9-ble**. 0.8.5–0.8.8 wedge STA (wifi task hang). Stairs live 0.8.4 is the existence proof this AP works. After 0.8.9, later OTAs stay on LAN: `/csi/stop` then `POST /ota`.
+Upstairs `192.168.0.47` is on **0.8.9-ble** (Wi-Fi + LAN OTA work). Flash **0.8.10-ble** over LAN — do not assume USB. 0.8.5–0.8.8 wedge STA (wifi task hang).
 
 On 0.8.6+:
 
