@@ -71,10 +71,12 @@ make -C firmware/atom-ble/tests/host
 
 After a successful build, the OTA-compatible **app image** (load address `0x20000`) is:
 
-| Path | What |
-|------|------|
-| `firmware/atom-ble/build/esp32-csi-node.bin` | IDF output |
-| `firmware/atom-ble/release/esp32-csi-node.bin` | Copied release (committed when size ≤ 900000) |
+| Path | Bytes | Notes |
+|------|------:|-------|
+| `firmware/atom-ble/release/esp32-csi-node.bin` | **828352** | Committed OTA payload (≤ 900000) |
+| `firmware/atom-ble/build/esp32-csi-node.bin` | 828352 | IDF output (not committed) |
+
+SHA-256: `8715241619843216799a9d4ebbd4982bda126dc50f05a253ca779e8c7c6eacdd` (see `release/SHA256SUMS.txt`). Built with ESP-IDF **v5.4.2**, version string `0.8.5-ble`.
 
 Push:
 

@@ -1,0 +1,11 @@
+esp32-csi-node.bin
+bytes: 828352
+limit: 900000
+live_ota_max_size: 921600
+sha256: 8715241619843216799a9d4ebbd4982bda126dc50f05a253ca779e8c7c6eacdd
+idf: v5.4.2
+target: esp32s3
+app_offset: 0x20000
+image_magic: 0xe9
+version: 0.8.5-ble
+built: 2026-08-29
