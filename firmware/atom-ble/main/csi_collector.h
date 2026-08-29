@@ -24,10 +24,16 @@
 #define CSI_HOP_CHANNELS_MAX 6
 
 /**
- * Initialize CSI collection.
- * Registers the WiFi CSI callback.
+ * Book-keeping only. Does not enable promiscuous/CSI (STA/HTTP first).
  */
 void csi_collector_init(void);
+
+/**
+ * Enable CSI the way live 0.8.4 atom-led does: WIFI_PS_NONE + MGMT-only
+ * promiscuous. Does not upgrade to MGMT+DATA (#893) — that path wedges
+ * Core 0 in `wifi` on this board.
+ */
+void csi_collector_start(void);
 
 /**
  * Capture node_id BEFORE wifi_init_sta() or any other heavy init.

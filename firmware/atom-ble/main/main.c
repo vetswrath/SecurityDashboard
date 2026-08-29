@@ -12,7 +12,6 @@
 #include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
-#include "esp_coexist.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -134,37 +133,15 @@ void app_main(void)
 
     wifi_init_sta();
 
-    /* 0.8.5/0.8.6: software coexist + WIFI_PS_NONE still let NimBLE starve
-     * STA TX. Prefer Wi-Fi so ICMP / :8032 / CSI UDP keep the RF. */
-    {
-        esp_err_t cex = esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
-        if (cex != ESP_OK) {
-            ESP_LOGW(TAG, "esp_coex_preference_set(WIFI) failed: %s",
-                     esp_err_to_name(cex));
-        } else {
-            ESP_LOGI(TAG, "coexist preference = WIFI (STA/ICMP/TCP win over BLE scan)");
-        }
-    }
-
     if (stream_sender_init_with(g_nvs_config.target_ip, g_nvs_config.target_port) != 0) {
         ESP_LOGE(TAG, "Failed to initialize UDP sender");
         return;
     }
 
+    /* 0.8.4 atom-led: HTTP on :8032 while CSI is MGMT-only. This tree used
+     * to enable CSI + MGMT+DATA before HTTP — that wedges wifi. Prove STA
+     * + OTA first, then turn CSI on (MGMT-only, no #893 DATA upgrade). */
     csi_collector_init();
-
-    if (g_nvs_config.channel_hop_count > 1) {
-        ESP_LOGI(TAG, "Starting channel hopping: %u channels, dwell=%lu ms",
-                 (unsigned)g_nvs_config.channel_hop_count,
-                 (unsigned long)g_nvs_config.dwell_ms);
-        csi_collector_set_hop_table(
-            g_nvs_config.channel_list,
-            g_nvs_config.channel_hop_count,
-            g_nvs_config.dwell_ms);
-    }
-
-    /* Display-less board: enable MGMT+DATA promiscuous CSI (RuView#893). */
-    csi_collector_enable_data_capture();
 
     httpd_handle_t ota_server = NULL;
     esp_err_t ota_ret = ota_update_init_ex((void **)&ota_server);
@@ -179,10 +156,23 @@ void app_main(void)
         ble_beacon_register_http(ota_server);
     }
 
-    /* duty=100 keeps WIFI_PS_NONE from csi_collector_init. */
     power_mgmt_init(g_nvs_config.power_duty);
 
-    ESP_LOGI(TAG, "CSI+OTA active → %s:%d (OTA=%s, BLE=%s, LED=GPIO35)",
+    ESP_LOGI(TAG, "STA+HTTP up — delaying CSI so ping/:8032 can answer");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    csi_collector_start();
+    if (g_nvs_config.channel_hop_count > 1) {
+        ESP_LOGI(TAG, "Starting channel hopping: %u channels, dwell=%lu ms",
+                 (unsigned)g_nvs_config.channel_hop_count,
+                 (unsigned long)g_nvs_config.dwell_ms);
+        csi_collector_set_hop_table(
+            g_nvs_config.channel_list,
+            g_nvs_config.channel_hop_count,
+            g_nvs_config.dwell_ms);
+    }
+
+    ESP_LOGI(TAG, "CSI MGMT-only → %s:%d (OTA=%s, BLE=%s, LED=GPIO35)",
              g_nvs_config.target_ip, g_nvs_config.target_port,
              (ota_ret == ESP_OK) ? "ready" : "off",
              (ble_ret == ESP_OK) ? "off until /ble/start" : "init-fail");

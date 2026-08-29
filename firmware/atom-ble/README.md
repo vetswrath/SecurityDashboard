@@ -30,14 +30,13 @@ Tonight’s OTA targets: node 1 upstairs-living `192.168.0.47`, node 2 stairs `1
 - Second dog later: Minor **4950**
 - Parse: Apple company ID `0x004C`, iBeacon type `0x02`
 
-**0.8.8-ble radio rule (this is what keeps CPU 0 out of `wifi`):** `ble_beacon_init()` does **not** call `nimble_port_init()`. The BLE controller is not started at boot, so it cannot take the 2.4 GHz radio or block the wifi task. 0.8.5–0.8.7 all hung STA with NimBLE up (IDLE0 / CPU0 stuck in `wifi`) even after CPU pin + 16% duty + `COEX_PREFER_WIFI`.
+**0.8.9-ble vs live 0.8.4 atom-led (wifi/CSI, not BLE):** 0.8.8 hung with NimBLE never started. Stairs 0.8.4 still answers. Differences this tree had that 0.8.4 does not:
 
-- Default: BLE scan **OFF**. `GET /ble/beacons` works and reports `"enabled":false`.
-- PSK `GET/POST :8032/ble/start` opts in. Each slice: controller on → ~80 ms scan → `nimble_port_stop` + `deinit` → 8 s Wi-Fi-only.
-- PSK `/ble/stop`, Wi-Fi TX fail, or OTA hold tears the controller down and leaves it off (TX fail clears enable).
-- `GET /ota/status` includes `ble_scan`, `ble_radio`, `ble_control`.
+1. **`csi_collector_enable_data_capture()` (MGMT+DATA, RuView#893)** — live atom-led stays **MGMT-only** (RuView#396). DATA promiscuous is documented to wedge Core 0 in `wDev_ProcessFiq` / `wifi`. **Removed from boot.**
+2. **`CONFIG_ESP_COEX_SW_COEXIST_ENABLE`** — 0.8.4 atom-led has no BT coexist in the wifi driver. This tree compiled it in even with BLE off. **Disabled.**
+3. **Boot order** — STA + `GET /ota/status` first, CSI radio off, then `csi_collector_start()` (MGMT-only). CSI callback: no `ESP_LOGI`, no `sendto`, no edge/sync work.
 
-OTA pause (`POST /ota` / `/csi/stop`) still pauses CSI and keeps BLE down.
+BLE stays default OFF (`nimble_port_init` only on PSK `/ble/start`).
 
 If NVS allow-list is unset, every iBeacon matching the Blue Charm UUID is reported.
 
@@ -84,11 +83,11 @@ After a successful build, the OTA-compatible **app image** (load address `0x2000
 | `firmware/atom-ble/release/esp32-csi-node.bin` | see `release/SIZE.txt` | Committed OTA payload (≤ 900000) |
 | `firmware/atom-ble/build/esp32-csi-node.bin` | same | IDF output (not committed) |
 
-Version **`0.8.8-ble`**. Size and SHA-256 go in `release/SIZE.txt` after the build. GitHub Release `v0.8.8-ble` (repo is public).
+Version **`0.8.9-ble`**. GitHub Release `v0.8.9-ble` (public repo).
 
 ### LAN OTA (0.8.6+ pause API; 0.8.7 STA-alive)
 
-USB-flash **0.8.7-ble** onto the live upstairs Atom (0.8.6 wedges STA: ping/` :8032` dead). After 0.8.7 is on the board, later OTAs stay on LAN: `/csi/stop` then `POST /ota`.
+USB-flash **0.8.9-ble**. 0.8.5–0.8.8 wedge STA (wifi task hang). Stairs live 0.8.4 is the existence proof this AP works. After 0.8.9, later OTAs stay on LAN: `/csi/stop` then `POST /ota`.
 
 On 0.8.6+:
 

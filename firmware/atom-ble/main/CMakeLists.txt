@@ -28,7 +28,6 @@ set(REQUIRES
     lwip
     bt
     json
-    esp_coex
 )
 
 idf_component_register(

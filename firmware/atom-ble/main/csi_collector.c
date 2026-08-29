@@ -332,22 +332,15 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
 
     s_cb_count++;
 
-    if (s_cb_count <= 3 || (s_cb_count % 100) == 0) {
-        ESP_LOGI(TAG, "CSI cb #%lu: len=%d rssi=%d ch=%d",
-                 (unsigned long)s_cb_count, info->len,
-                 info->rx_ctrl.rssi, info->rx_ctrl.channel);
-    }
-
+    /* No ESP_LOGI / sendto / edge work here — wifi-task context.
+     * 0.8.4 atom-led also serializes + queues; this tree no longer logs
+     * or builds ADR-110 sync packets in the callback (those blocked IDLE0). */
     uint8_t frame_buf[CSI_MAX_FRAME_SIZE];
     size_t frame_len = csi_serialize_frame(info, frame_buf, sizeof(frame_buf));
 
     if (frame_len > 0) {
-        /* Rate-limit UDP sends to avoid ENOMEM from lwIP pbuf exhaustion.
-         * In promiscuous mode, CSI callbacks can fire 100-500+ times/sec.
-         * We only need 20-50 Hz for the sensing pipeline. */
         int64_t now = esp_timer_get_time();
         if ((now - s_last_send_us) >= CSI_MIN_SEND_INTERVAL_US) {
-            /* Queue only — never sendto() in the Wi-Fi/CSI callback. */
             if (csi_enqueue_udp(frame_buf, frame_len)) {
                 s_last_send_us = now;
             } else {
@@ -355,64 +348,6 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
             }
         } else {
             s_rate_skip++;
-        }
-    }
-
-    /* ADR-039: Enqueue raw I/Q into edge processing ring buffer. */
-    if (info->buf && info->len > 0) {
-        edge_enqueue_csi((const uint8_t *)info->buf, (uint16_t)info->len,
-                         (int8_t)info->rx_ctrl.rssi, info->rx_ctrl.channel);
-    }
-
-    /* ADR-110 §A0.11/§A0.12 — Emit a sync-packet every N CSI frames so the
-     * host aggregator can pair node-local sequence numbers with the mesh-aligned
-     * epoch coming out of c6_sync_espnow_get_epoch_us(). Backwards-compatible
-     * with the ADR-018 frame format: new packet uses a distinct magic so the
-     * existing CSI parser can dispatch by first 4 bytes.
-     *
-     * Cadence is operator-tunable via CONFIG_C6_SYNC_EVERY_N_FRAMES (default 20).
-     * At 10 Hz observed CSI rate that's ~2 s between sync packets; raise to 50
-     * for ~5 s (less overhead, slower convergence), lower to 5 for ~0.5 s
-     * (heavier wire, tighter ADR-029/030 multistatic alignment window). */
-    {
-#ifndef CONFIG_C6_SYNC_EVERY_N_FRAMES
-#define CONFIG_C6_SYNC_EVERY_N_FRAMES 20
-#endif
-        if ((s_cb_count % CONFIG_C6_SYNC_EVERY_N_FRAMES) == 0) {
-            uint8_t sync[32];
-            uint32_t sync_magic = 0xC511A110u;    /* CSI-ADR-110 sync packet */
-            uint64_t local_us = (uint64_t)esp_timer_get_time();
-            uint64_t epoch_us = c6_sync_espnow_get_epoch_us();
-            int64_t  off_smooth = c6_sync_espnow_get_offset_us_smoothed();
-            uint8_t  flags = 0;
-            if (c6_sync_espnow_is_leader()) flags |= 0x01;
-            if (c6_sync_espnow_is_valid())  flags |= 0x02;
-            if (off_smooth != 0)            flags |= 0x04;
-
-            memcpy(&sync[0],  &sync_magic, 4);
-            sync[4] = s_node_id;
-            sync[5] = 0x01;                       /* protocol version */
-            sync[6] = flags;
-            sync[7] = 0;                          /* reserved */
-            memcpy(&sync[8],  &local_us, 8);
-            memcpy(&sync[16], &epoch_us, 8);
-            memcpy(&sync[24], &s_sequence, 4);    /* high-water seq for pairing */
-            uint32_t zero32 = 0;
-            memcpy(&sync[28], &zero32, 4);        /* reserved (room for leader_id low32) */
-            /* Sync packets are 32 B at ~0.5 Hz — priority path so the CSI
-             * ENOMEM backoff can't starve cross-node time alignment (#1183). */
-            int sr = csi_enqueue_udp(sync, sizeof(sync)) ? 1 : -1;
-            static uint32_t s_sync_count = 0;
-            s_sync_count++;
-            if (s_sync_count <= 3 || (s_sync_count % 60) == 0) {
-                ESP_LOGI(TAG, "sync-pkt #%lu (sr=%d) node=%u flags=0x%02x "
-                              "local_us=%llu epoch_us=%llu seq=%lu",
-                         (unsigned long)s_sync_count, sr,
-                         (unsigned)s_node_id, (unsigned)flags,
-                         (unsigned long long)local_us,
-                         (unsigned long long)epoch_us,
-                         (unsigned long)s_sequence);
-            }
         }
     }
 }
@@ -579,13 +514,26 @@ void csi_collector_init(void)
     /* Update the hop table's first channel to match. */
     s_hop_channels[0] = csi_channel;
 
-    /* Disable WiFi modem sleep — reliable CSI capture needs the radio awake.
-     * The ESP-IDF STA default is WIFI_PS_MIN_MODEM, which lets the modem
-     * sleep between DTIM beacons; with the MGMT-only promiscuous filter
-     * (RuView#396) that starves the CSI callback and the per-second yield
-     * collapses toward 0 pps (RuView#521). Operators who want battery
-     * duty-cycling opt back in via power_mgmt_init() (provision.py
-     * --duty-cycle <N>), which runs after this and re-enables modem sleep. */
+    s_tx_q = xQueueCreate(CSI_TX_SLOTS, sizeof(uint8_t));
+    if (s_tx_q != NULL) {
+        (void)xTaskCreatePinnedToCore(csi_tx_task, "csi_udp", 4096, NULL, 5, NULL, 1);
+    } else {
+        ESP_LOGE(TAG, "CSI UDP queue alloc failed");
+    }
+
+    s_paused = true;
+    ESP_LOGI(TAG, "CSI bookkeeping ready (node_id=%u, channel=%u) — radio still off",
+             (unsigned)s_node_id, (unsigned)csi_channel);
+}
+
+void csi_collector_start(void)
+{
+    /* Live 0.8.4 atom-led: WIFI_PS_NONE + MGMT-only promiscuous + CSI.
+     * This tree's 0.8.5–0.8.8 also called enable_data_capture() (MGMT+DATA
+     * #893) at boot. DATA-frame promiscuous is what RuView#396 says wedges
+     * Core 0 in wDev_ProcessFiq/`wifi`. Do not upgrade the filter. */
+    s_data_capture = false;
+
     esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
     if (ps_err != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_set_ps(WIFI_PS_NONE) failed: %s — CSI yield may be low",
@@ -660,20 +608,11 @@ void csi_collector_init(void)
                  g_nvs_config.filter_mac[4], g_nvs_config.filter_mac[5]);
     }
 
-    ESP_LOGI(TAG, "CSI collection initialized (node_id=%u, channel=%u)",
-             (unsigned)s_node_id, (unsigned)csi_channel);
+    ESP_LOGI(TAG, "CSI radio on MGMT-only (node_id=%u, channel=%u) — no DATA filter",
+             (unsigned)s_node_id, (unsigned)s_hop_channels[0]);
 
-    s_tx_q = xQueueCreate(CSI_TX_SLOTS, sizeof(uint8_t));
-    if (s_tx_q != NULL) {
-        (void)xTaskCreatePinnedToCore(csi_tx_task, "csi_udp", 4096, NULL, 5, NULL, 1);
-    } else {
-        ESP_LOGE(TAG, "CSI UDP queue alloc failed");
-    }
-
-    /* RuView#521/#954: start the connected-STA traffic source so the CSI engine
-     * receives a guaranteed OFDM unicast floor even when promiscuous capture is
-     * starved (display builds / quiet networks). Additive to #396/#893. */
     csi_start_self_ping();
+    s_paused = false;
 }
 
 /* Accessor for other modules that need the authoritative runtime node_id. */

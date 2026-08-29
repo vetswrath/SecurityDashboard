@@ -34,12 +34,13 @@ CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
 # CONFIG_ESP_WIFI_ENABLE_WPA3_SAE is not set
 # CONFIG_MBEDTLS_CERTIFICATE_BUNDLE is not set
 
-# Wi-Fi + BLE software coexistence. CSI stays on WIFI_PS_NONE.
-# Prefer Wi-Fi in software coexist (see esp_coex_preference_set in main.c).
-# Pin NimBLE host + BLE controller to CPU 1; Wi-Fi task stays on CPU 0.
-# 0.8.5/0.8.6 pinned both to CPU 0 and 300ms 100% BLE scan wedged STA TX.
-CONFIG_SW_COEXIST_ENABLE=y
-CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+# Live 0.8.4 atom-led has NO BT software coexist in the wifi driver.
+# 0.8.5–0.8.8 compiled SW coexist into wifi even with NimBLE unstarted;
+# CPU 0 then blocked in `wifi`. Keep coexist off so STA matches 0.8.4.
+# CONFIG_SW_COEXIST_ENABLE is not set
+# CONFIG_ESP_COEX_SW_COEXIST_ENABLE is not set
+# CONFIG_ESP_WIFI_SW_COEXIST_ENABLE is not set
+# CONFIG_ESP32_WIFI_SW_COEXIST_ENABLE is not set
 CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
 CONFIG_BT_NIMBLE_PINNED_TO_CORE_1=y
 CONFIG_BT_NIMBLE_PINNED_TO_CORE=1
