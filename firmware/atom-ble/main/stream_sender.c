@@ -6,6 +6,7 @@
  */
 
 #include "stream_sender.h"
+#include "ble_beacon.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -112,12 +113,14 @@ int stream_sender_send(const uint8_t *data, size_t len)
                      (unsigned long)cooldown, (unsigned long)s_enomem_streak);
         } else {
             ESP_LOGW(TAG, "sendto failed: errno %d", errno);
+            ble_beacon_note_wifi_tx_fail();
         }
         return -1;
     }
 
     /* A send got through — buffer pressure cleared; reset the backoff streak. */
     s_enomem_streak = 0;
+    ble_beacon_note_wifi_ok();
     return sent;
 }
 

@@ -30,7 +30,17 @@ Tonight’s OTA targets: node 1 upstairs-living `192.168.0.47`, node 2 stairs `1
 - Second dog later: Minor **4950**
 - Parse: Apple company ID `0x004C`, iBeacon type `0x02`
 
-**Coexistence:** ESP-IDF software Wi-Fi/BLE coexistence (`CONFIG_SW_COEXIST_ENABLE`) plus **time-sliced NimBLE observer** — default **300 ms scan every 2.5 s**. Wi-Fi stays `WIFI_PS_NONE`. CSI fps may dip during a scan window.
+**Coexistence (0.8.7-ble — this is the STA-alive fix):** 0.8.5/0.8.6 ran NimBLE `ble_gap_disc` for **300 ms at 100% duty** (`itvl == window`) every 2.5 s on **CPU 0** next to the Wi-Fi task, and CSI `sendto` ran *inside* the Wi-Fi/CSI callback. That wedged STA TX: `ping_sock: send error=0`, ICMP/TCP `:8032` dead, `task_wdt` on IDLE0 / CPU0 stuck in `wifi`. Green LED stayed on because `GOT_IP` had already happened.
+
+Concrete changes (point at these in code):
+
+1. **`main.c`**: `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)` after STA is up.
+2. **`sdkconfig.defaults`**: NimBLE host + BLE controller **pinned to CPU 1**; Wi-Fi task stays **CPU 0**.
+3. **`ble_beacon.c`**: one **continuous** passive scan at **~16 ms RX / 100 ms** (~16% BLE). Firmware **clamps** any leftover 300/2500 Kconfig so a stale `sdkconfig` cannot restore the hang. Do **not** start/stop 300 ms 100% bursts (RF calib wedges wifi).
+4. **`ble_beacon.c`**: GAP callback never `sendto`; BLE UDP is a CPU-1 task. If Wi-Fi TX fails several times, BLE scan backs off 8 s.
+5. **`csi_collector.c`**: CSI UDP is queued and sent from `csi_udp` on CPU 1 — never `sendto` from the Wi-Fi callback.
+
+OTA pause (`POST /ota` / `/csi/stop`) is unchanged and is **not** this bug.
 
 If NVS allow-list is unset, every iBeacon matching the Blue Charm UUID is reported.
 
@@ -74,17 +84,14 @@ After a successful build, the OTA-compatible **app image** (load address `0x2000
 
 | Path | Bytes | Notes |
 |------|------:|-------|
-| `firmware/atom-ble/release/esp32-csi-node.bin` | **830336** | Committed OTA payload (≤ 900000) |
-| `firmware/atom-ble/build/esp32-csi-node.bin` | 830336 | IDF output (not committed) |
+| `firmware/atom-ble/release/esp32-csi-node.bin` | see `release/SIZE.txt` | Committed OTA payload (≤ 900000) |
+| `firmware/atom-ble/build/esp32-csi-node.bin` | same | IDF output (not committed) |
 
-SHA-256: `c1e651025d6248753e527145f5c492151ab1396df9f800fa588e85634ca021b3` (see `release/SHA256SUMS.txt`). Built with ESP-IDF **v5.4.2**, version string `0.8.6-ble`.
+Version **`0.8.7-ble`**. Size and SHA-256 are in `release/SIZE.txt` after the build. ESP-IDF **v5.4.2**.
 
-- GitHub Release (private repo, needs auth): https://github.com/vetswrath/SecurityDashboard/releases/download/v0.8.6-ble/esp32-csi-node.bin
-- No-auth copy (litterbox ~72h, same SHA): https://litter.catbox.moe/2qq3qk.bin
+### LAN OTA (0.8.6+ pause API; 0.8.7 STA-alive)
 
-### LAN OTA (0.8.6-ble and later)
-
-Live **0.8.4** has no CSI-pause HTTP API. CSI UDP while receiving an ~828 KB `POST /ota` saturates 2.4 GHz and the upload times out (120s / 300s). USB-flash **0.8.6-ble once**. After that, later OTAs stay on LAN and should finish in about a minute.
+USB-flash **0.8.7-ble** onto the live upstairs Atom (0.8.6 wedges STA: ping/` :8032` dead). After 0.8.7 is on the board, later OTAs stay on LAN: `/csi/stop` then `POST /ota`.
 
 On 0.8.6+:
 

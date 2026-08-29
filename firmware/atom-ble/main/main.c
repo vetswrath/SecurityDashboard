@@ -12,6 +12,7 @@
 #include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_coexist.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -132,6 +133,18 @@ void app_main(void)
     (void)led_status_init();
 
     wifi_init_sta();
+
+    /* 0.8.5/0.8.6: software coexist + WIFI_PS_NONE still let NimBLE starve
+     * STA TX. Prefer Wi-Fi so ICMP / :8032 / CSI UDP keep the RF. */
+    {
+        esp_err_t cex = esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+        if (cex != ESP_OK) {
+            ESP_LOGW(TAG, "esp_coex_preference_set(WIFI) failed: %s",
+                     esp_err_to_name(cex));
+        } else {
+            ESP_LOGI(TAG, "coexist preference = WIFI (STA/ICMP/TCP win over BLE scan)");
+        }
+    }
 
     if (stream_sender_init_with(g_nvs_config.target_ip, g_nvs_config.target_port) != 0) {
         ESP_LOGE(TAG, "Failed to initialize UDP sender");

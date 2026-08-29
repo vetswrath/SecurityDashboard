@@ -1,10 +1,19 @@
 /**
  * @file ble_beacon.c
- * @brief Time-sliced NimBLE iBeacon observer for Blue Charm collar tags.
+ * @brief Low-duty NimBLE iBeacon observer for Blue Charm collar tags.
  *
- * Coexistence: ESP-IDF software Wi-Fi/BLE coexistence + short observer
- * windows (default 300 ms every 2.5 s). Wi-Fi stays on WIFI_PS_NONE so CSI
- * keeps running; fps may dip during a scan window.
+ * 0.8.5/0.8.6 wedged STA: ble_gap_disc ran 300 ms at 100% duty (itvl==window)
+ * every 2.5 s on CPU 0 next to the Wi-Fi task. CSI sendto from the Wi-Fi
+ * callback then blocked on RF. Symptom: ping_sock send error=0, ICMP/TCP
+ * dead, task_wdt IDLE0 / CPU0 stuck in wifi.
+ *
+ * Coexist (this file + sdkconfig.defaults + main.c):
+ *   1. Continuous passive scan at ~16 ms RX / 100 ms interval (~16% BLE).
+ *      Do not start/stop 300 ms 100% bursts (RF calib wedges wifi).
+ *   2. NimBLE host + controller pinned to CPU 1; Wi-Fi stays CPU 0.
+ *   3. GAP callback never sendto — UDP is a separate task.
+ *   4. If Wi-Fi TX fails, cancel scan for 8 s, then resume.
+ *   5. main.c sets ESP_COEX_PREFER_WIFI.
  */
 #include "ble_beacon.h"
 #include "ble_ibeacon.h"
@@ -17,6 +26,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs.h"
@@ -24,17 +34,25 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+#include "host/ble_hs_id.h"
 #include "host/ble_gap.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "ble_beacon";
 
 #ifndef CONFIG_BLE_SCAN_WINDOW_MS
-#define CONFIG_BLE_SCAN_WINDOW_MS 300
+#define CONFIG_BLE_SCAN_WINDOW_MS 16
 #endif
 #ifndef CONFIG_BLE_SCAN_PERIOD_MS
-#define CONFIG_BLE_SCAN_PERIOD_MS 2500
+#define CONFIG_BLE_SCAN_PERIOD_MS 100
 #endif
+
+/* Hard cap: 0.8.5/0.8.6 Kconfig was 300/2500 at 100% duty and hung STA. */
+#define BLE_RF_WINDOW_MAX_MS    24
+#define BLE_RF_INTERVAL_MIN_MS  80
+#define BLE_RF_INTERVAL_MAX_MS  200
+#define BLE_WIFI_FAIL_BACKOFF_US (8LL * 1000 * 1000)
+#define BLE_WIFI_FAIL_THRESH    8
 
 #define BLE_SIGHTING_MAX      8
 #define BLE_ALLOW_MAC_MAX     8
@@ -70,6 +88,11 @@ typedef struct {
 static ble_sighting_t s_sight[BLE_SIGHTING_MAX];
 static SemaphoreHandle_t s_lock;
 static volatile bool s_nimble_synced;
+static uint8_t s_own_addr_type;
+static QueueHandle_t s_udp_q;
+static volatile int64_t s_backoff_until_us;
+static volatile uint32_t s_wifi_fail_streak;
+static volatile bool s_need_restart;
 
 static uint8_t s_filter_uuid[16] = { BLE_BLUECHARM_UUID_BYTES };
 static uint8_t s_allow_mac[BLE_ALLOW_MAC_MAX][6];
@@ -163,7 +186,7 @@ static void send_udp_sighting(const ble_sighting_t *s)
 static void record_sighting(const uint8_t mac[6], const ble_ibeacon_t *ib, int8_t rssi)
 {
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) != pdTRUE) {
+    if (xSemaphoreTake(s_lock, 0) != pdTRUE) {
         return;
     }
     int slot = -1;
@@ -189,12 +212,20 @@ static void record_sighting(const uint8_t mac[6], const ble_ibeacon_t *ib, int8_
     s_sight[slot].used = 1;
     ble_sighting_t copy = s_sight[slot];
     xSemaphoreGive(s_lock);
-    send_udp_sighting(&copy);
+    /* Never sendto from the NimBLE host / GAP callback — that deadlocks
+     * against the Wi-Fi task when BLE holds the 2.4 GHz radio. */
+    if (s_udp_q != NULL) {
+        (void)xQueueSend(s_udp_q, &copy, 0);
+    }
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
+    if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
+        s_need_restart = true;
+        return 0;
+    }
     if (event->type != BLE_GAP_EVENT_DISC) {
         return 0;
     }
@@ -214,17 +245,60 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     return 0;
 }
 
-static void start_scan_window(void)
+static void ble_rf_duty_ms(int *window_ms, int *interval_ms)
 {
+    int win = CONFIG_BLE_SCAN_WINDOW_MS;
+    int ivl = CONFIG_BLE_SCAN_PERIOD_MS;
+    if (win > BLE_RF_WINDOW_MAX_MS) {
+        win = 16;
+    }
+    if (ivl < BLE_RF_INTERVAL_MIN_MS || ivl > BLE_RF_INTERVAL_MAX_MS) {
+        ivl = 100;
+    }
+    if (win >= ivl) {
+        win = ivl / 6;
+        if (win < 8) {
+            win = 8;
+        }
+    }
+    *window_ms = win;
+    *interval_ms = ivl;
+}
+
+static int start_low_duty_scan(void)
+{
+    int win_ms, ivl_ms;
+    ble_rf_duty_ms(&win_ms, &ivl_ms);
+
     struct ble_gap_disc_params params = {0};
-    params.itvl = 48;     /* 30 ms */
-    params.window = 48;
+    /* NimBLE units are 0.625 ms. window << interval so Wi-Fi keeps the RF. */
+    params.itvl = (uint16_t)((ivl_ms * 8) / 5);
+    params.window = (uint16_t)((win_ms * 8) / 5);
+    if (params.window < 16) {
+        params.window = 16; /* 10 ms */
+    }
+    if (params.itvl <= params.window) {
+        params.itvl = (uint16_t)(params.window * 6);
+    }
     params.passive = 1;
-    params.filter_duplicates = 0;
-    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, CONFIG_BLE_SCAN_WINDOW_MS,
-                          &params, gap_event, NULL);
+    params.filter_duplicates = 1;
+
+    int rc = ble_gap_disc(s_own_addr_type, BLE_HS_FOREVER, &params, gap_event, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         ESP_LOGW(TAG, "ble_gap_disc rc=%d", rc);
+        return rc;
+    }
+    ESP_LOGI(TAG, "BLE continuous scan %u/%u units (~%d ms / %d ms, prefer Wi-Fi)",
+             (unsigned)params.window, (unsigned)params.itvl, win_ms, ivl_ms);
+    return 0;
+}
+
+static void ble_udp_task(void *arg)
+{
+    (void)arg;
+    ble_sighting_t s;
+    while (xQueueReceive(s_udp_q, &s, portMAX_DELAY) == pdTRUE) {
+        send_udp_sighting(&s);
     }
 }
 
@@ -234,25 +308,33 @@ static void scan_task(void *arg)
     while (!s_nimble_synced) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-    ESP_LOGI(TAG, "BLE time-slice: %d ms window / %d ms period (CSI may dip in window)",
-             CONFIG_BLE_SCAN_WINDOW_MS, CONFIG_BLE_SCAN_PERIOD_MS);
-    const int idle_ms = CONFIG_BLE_SCAN_PERIOD_MS - CONFIG_BLE_SCAN_WINDOW_MS;
+    /* Let STA, ping_sock, and :8032 come up before the BLE controller
+     * touches the radio. /ota/status must answer within ~15 s of boot. */
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    if (!s_scan_paused) {
+        start_low_duty_scan();
+    }
+
     while (1) {
-        if (s_scan_paused) {
+        int64_t now = esp_timer_get_time();
+        bool backoff = (s_backoff_until_us > 0 && now < s_backoff_until_us);
+        if (s_scan_paused || backoff) {
             if (ble_gap_disc_active()) {
                 ble_gap_disc_cancel();
             }
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
-        start_scan_window();
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_BLE_SCAN_WINDOW_MS + 20));
-        if (ble_gap_disc_active()) {
-            ble_gap_disc_cancel();
+        if (s_backoff_until_us > 0 && now >= s_backoff_until_us) {
+            s_backoff_until_us = 0;
+            s_need_restart = true;
+            ESP_LOGI(TAG, "BLE scan backoff done — restarting low-duty scan");
         }
-        if (idle_ms > 0) {
-            vTaskDelay(pdMS_TO_TICKS(idle_ms));
+        if (s_need_restart || !ble_gap_disc_active()) {
+            s_need_restart = false;
+            start_low_duty_scan();
         }
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -268,6 +350,7 @@ void ble_beacon_pause(void)
 void ble_beacon_resume(void)
 {
     s_scan_paused = false;
+    s_need_restart = true;
     ESP_LOGI(TAG, "BLE scan resumed");
 }
 
@@ -276,10 +359,38 @@ bool ble_beacon_is_paused(void)
     return s_scan_paused;
 }
 
+void ble_beacon_note_wifi_ok(void)
+{
+    s_wifi_fail_streak = 0;
+}
+
+void ble_beacon_note_wifi_tx_fail(void)
+{
+    if (s_scan_paused) {
+        return;
+    }
+    s_wifi_fail_streak++;
+    if (s_wifi_fail_streak < BLE_WIFI_FAIL_THRESH) {
+        return;
+    }
+    s_wifi_fail_streak = 0;
+    s_backoff_until_us = esp_timer_get_time() + BLE_WIFI_FAIL_BACKOFF_US;
+    if (s_nimble_synced && ble_gap_disc_active()) {
+        ble_gap_disc_cancel();
+    }
+    ESP_LOGW(TAG, "Wi-Fi TX failing — BLE scan backoff 8s so STA can recover");
+}
+
 static void on_sync(void)
 {
+    int rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
+    if (rc != 0) {
+        s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
+        ESP_LOGW(TAG, "ble_hs_id_infer_auto rc=%d — using public", rc);
+    }
     s_nimble_synced = true;
-    ESP_LOGI(TAG, "NimBLE synced — observer ready");
+    ESP_LOGI(TAG, "NimBLE synced — observer ready (addr_type=%u)",
+             (unsigned)s_own_addr_type);
 }
 
 static void on_reset(int reason)
@@ -381,7 +492,15 @@ esp_err_t ble_beacon_init(void)
     }
     nimble_port_freertos_init(nimble_host_task);
 
-    if (xTaskCreate(scan_task, "ble_scan", 3072, NULL, 5, NULL) != pdPASS) {
+    s_udp_q = xQueueCreate(4, sizeof(ble_sighting_t));
+    if (s_udp_q == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    /* CPU 1: keep NimBLE + BLE UDP off the Wi-Fi core (CPU 0). */
+    if (xTaskCreatePinnedToCore(ble_udp_task, "ble_udp", 3072, NULL, 4, NULL, 1) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreatePinnedToCore(scan_task, "ble_scan", 3072, NULL, 4, NULL, 1) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;

@@ -35,9 +35,16 @@ CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
 # CONFIG_MBEDTLS_CERTIFICATE_BUNDLE is not set
 
 # Wi-Fi + BLE software coexistence. CSI stays on WIFI_PS_NONE.
-# BLE is time-sliced (short observer windows) so CSI is not left off.
+# Prefer Wi-Fi in software coexist (see esp_coex_preference_set in main.c).
+# Pin NimBLE host + BLE controller to CPU 1; Wi-Fi task stays on CPU 0.
+# 0.8.5/0.8.6 pinned both to CPU 0 and 300ms 100% BLE scan wedged STA TX.
 CONFIG_SW_COEXIST_ENABLE=y
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_1=y
+CONFIG_BT_NIMBLE_PINNED_TO_CORE=1
+CONFIG_BT_CTRL_PINNED_TO_CORE_1=y
+CONFIG_BT_CTRL_PINNED_TO_CORE=1
 
 # NimBLE observer-only (no connections / GATT / SMP) — flash budget
 CONFIG_BT_ENABLED=y
@@ -68,7 +75,9 @@ CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
 
 CONFIG_LED_GPIO=35
 CONFIG_LED_GREEN_LEVEL=8
-CONFIG_BLE_SCAN_WINDOW_MS=300
-CONFIG_BLE_SCAN_PERIOD_MS=2500
+# Continuous low-duty scan (window << interval). Firmware also clamps
+# stale 300/2500 values so a leftover sdkconfig cannot hang STA.
+CONFIG_BLE_SCAN_WINDOW_MS=16
+CONFIG_BLE_SCAN_PERIOD_MS=100
 CONFIG_CSI_TARGET_IP="192.168.0.39"
 CONFIG_CSI_TARGET_PORT=5005

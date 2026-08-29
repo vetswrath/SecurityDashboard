@@ -26,6 +26,10 @@
 #include "esp_netif.h"          /* #954: STA gateway lookup for self-ping CSI source */
 #include "ping/ping_sock.h"     /* #954: esp_ping gateway traffic generator */
 #include "lwip/ip_addr.h"       /* #954: ip_addr_t target for esp_ping */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "ble_beacon.h"
 
 /* ADR-060: Access the global NVS config for MAC filter and channel override. */
 extern nvs_config_t g_nvs_config;
@@ -75,6 +79,57 @@ static uint32_t s_rate_skip = 0;
  */
 #define CSI_MIN_SEND_INTERVAL_US  (20 * 1000)
 static int64_t s_last_send_us = 0;
+
+/* CSI callback runs in Wi-Fi context. sendto() from there blocked the wifi
+ * task when BLE held the RF (0.8.5/0.8.6). Copy to a slot and send from
+ * csi_udp on CPU 1. */
+#define CSI_TX_SLOTS 3
+static uint8_t s_tx_slot[CSI_TX_SLOTS][CSI_MAX_FRAME_SIZE];
+static uint16_t s_tx_slot_len[CSI_TX_SLOTS];
+static volatile uint8_t s_tx_slot_busy[CSI_TX_SLOTS];
+static QueueHandle_t s_tx_q;
+
+static bool csi_enqueue_udp(const uint8_t *data, size_t len)
+{
+    if (s_tx_q == NULL || data == NULL || len == 0 || len > CSI_MAX_FRAME_SIZE) {
+        return false;
+    }
+    for (int i = 0; i < CSI_TX_SLOTS; i++) {
+        if (s_tx_slot_busy[i] == 0) {
+            s_tx_slot_busy[i] = 1;
+            memcpy(s_tx_slot[i], data, len);
+            s_tx_slot_len[i] = (uint16_t)len;
+            uint8_t idx = (uint8_t)i;
+            if (xQueueSend(s_tx_q, &idx, 0) != pdTRUE) {
+                s_tx_slot_busy[i] = 0;
+                return false;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void csi_tx_task(void *arg)
+{
+    (void)arg;
+    uint8_t idx;
+    while (xQueueReceive(s_tx_q, &idx, portMAX_DELAY) == pdTRUE) {
+        if (idx < CSI_TX_SLOTS && !s_paused) {
+            int ret = stream_sender_send(s_tx_slot[idx], s_tx_slot_len[idx]);
+            if (ret > 0) {
+                s_send_ok++;
+                ble_beacon_note_wifi_ok();
+            } else {
+                s_send_fail++;
+                ble_beacon_note_wifi_tx_fail();
+            }
+        }
+        if (idx < CSI_TX_SLOTS) {
+            s_tx_slot_busy[idx] = 0;
+        }
+    }
+}
 
 /**
  * Minimum interval between processing ANY CSI callback in microseconds.
@@ -292,15 +347,11 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
          * We only need 20-50 Hz for the sensing pipeline. */
         int64_t now = esp_timer_get_time();
         if ((now - s_last_send_us) >= CSI_MIN_SEND_INTERVAL_US) {
-            int ret = stream_sender_send(frame_buf, frame_len);
-            if (ret > 0) {
-                s_send_ok++;
+            /* Queue only — never sendto() in the Wi-Fi/CSI callback. */
+            if (csi_enqueue_udp(frame_buf, frame_len)) {
                 s_last_send_us = now;
             } else {
                 s_send_fail++;
-                if (s_send_fail <= 5) {
-                    ESP_LOGW(TAG, "sendto failed (fail #%lu)", (unsigned long)s_send_fail);
-                }
             }
         } else {
             s_rate_skip++;
@@ -350,7 +401,7 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
             memcpy(&sync[28], &zero32, 4);        /* reserved (room for leader_id low32) */
             /* Sync packets are 32 B at ~0.5 Hz — priority path so the CSI
              * ENOMEM backoff can't starve cross-node time alignment (#1183). */
-            int sr = stream_sender_send_priority(sync, sizeof(sync));
+            int sr = csi_enqueue_udp(sync, sizeof(sync)) ? 1 : -1;
             static uint32_t s_sync_count = 0;
             s_sync_count++;
             if (s_sync_count <= 3 || (s_sync_count % 60) == 0) {
@@ -393,7 +444,19 @@ static void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type)
  * Espressif's esp-csi csi_recv_router reference.
  */
 static esp_ping_handle_t s_self_ping = NULL;
-static void csi_ping_cb_noop(esp_ping_handle_t hdl, void *args) { (void)hdl; (void)args; }
+static void csi_ping_cb_ok(esp_ping_handle_t hdl, void *args)
+{
+    (void)hdl;
+    (void)args;
+    ble_beacon_note_wifi_ok();
+}
+
+static void csi_ping_cb_timeout(esp_ping_handle_t hdl, void *args)
+{
+    (void)hdl;
+    (void)args;
+    /* ICMP timeout is a missing reply, not a send failure. */
+}
 
 static void csi_start_self_ping(void)
 {
@@ -424,9 +487,9 @@ static void csi_start_self_ping(void)
 
     esp_ping_callbacks_t cbs = {
         .cb_args         = NULL,
-        .on_ping_success = csi_ping_cb_noop,
-        .on_ping_timeout = csi_ping_cb_noop,
-        .on_ping_end     = csi_ping_cb_noop,
+        .on_ping_success = csi_ping_cb_ok,
+        .on_ping_timeout = csi_ping_cb_timeout,
+        .on_ping_end     = NULL,
     };
 
     if (esp_ping_new_session(&cfg, &cbs, &s_self_ping) == ESP_OK && s_self_ping != NULL) {
@@ -599,6 +662,13 @@ void csi_collector_init(void)
 
     ESP_LOGI(TAG, "CSI collection initialized (node_id=%u, channel=%u)",
              (unsigned)s_node_id, (unsigned)csi_channel);
+
+    s_tx_q = xQueueCreate(CSI_TX_SLOTS, sizeof(uint8_t));
+    if (s_tx_q != NULL) {
+        (void)xTaskCreatePinnedToCore(csi_tx_task, "csi_udp", 4096, NULL, 5, NULL, 1);
+    } else {
+        ESP_LOGE(TAG, "CSI UDP queue alloc failed");
+    }
 
     /* RuView#521/#954: start the connected-STA traffic source so the CSI engine
      * receives a guaranteed OFDM unicast floor even when promiscuous capture is
