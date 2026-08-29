@@ -10,8 +10,8 @@ AtomS3 Lite CSI nodes with HTTP OTA and BLE iBeacon scan for Blue Charm dog-coll
 
 - Board: M5Stack AtomS3 Lite (ESP32-S3, 8MB), LED GPIO 35
 - Live OTA cap: **921600** bytes (`POST :8032/ota`). New app `.bin` must be **≤ 900000**
-- Release payload: `firmware/atom-ble/release/esp32-csi-node.bin` (app at `0x20000`, version **0.8.7-ble**, ≤ 900000 bytes)
-- 0.8.7 coexist: BLE on CPU 1, continuous ~16/100 ms scan, `ESP_COEX_PREFER_WIFI`, CSI UDP off the Wi-Fi task. USB-flash 0.8.7 (0.8.6 wedges STA).
+- Release payload: `firmware/atom-ble/release/esp32-csi-node.bin` (app at `0x20000`, version **0.8.8-ble**)
+- 0.8.8: NimBLE controller is **not** started at boot (`nimble_port_init` only on PSK `/ble/start`). USB-flash 0.8.8 — 0.8.5–0.8.7 wedge STA.
 - LAN OTA: if `GET :8032/ota/status` reports `csi_control`, call `POST :8032/csi/stop` (Bearer PSK) **before** `POST /ota`. See `firmware/atom-ble/ota_client.py`.
 - See [`firmware/atom-ble/README.md`](firmware/atom-ble/README.md) for build and OTA notes
 

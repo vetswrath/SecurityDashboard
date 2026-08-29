@@ -182,10 +182,10 @@ void app_main(void)
     /* duty=100 keeps WIFI_PS_NONE from csi_collector_init. */
     power_mgmt_init(g_nvs_config.power_duty);
 
-    ESP_LOGI(TAG, "CSI+BLE active → %s:%d (OTA=%s, BLE=%s, LED=GPIO35)",
+    ESP_LOGI(TAG, "CSI+OTA active → %s:%d (OTA=%s, BLE=%s, LED=GPIO35)",
              g_nvs_config.target_ip, g_nvs_config.target_port,
              (ota_ret == ESP_OK) ? "ready" : "off",
-             (ble_ret == ESP_OK) ? "scan" : "off");
+             (ble_ret == ESP_OK) ? "off until /ble/start" : "init-fail");
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));

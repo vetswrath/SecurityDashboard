@@ -4,8 +4,8 @@
 If GET /ota/status reports csi_control (0.8.6-ble+), mute CSI+BLE with
 /csi/stop before POST /ota so the 2.4 GHz radio can finish the upload
 in about a minute. Live 0.8.4 has no /csi/stop — POST /ota alone will
-time out while CSI UDP is running. USB-flash 0.8.7-ble (0.8.6 wedges
-STA). Later OTAs use this client.
+time out while CSI UDP is running. USB-flash 0.8.8-ble (0.8.5–0.8.7
+wedge STA while NimBLE is up). Later OTAs use this client.
 """
 from __future__ import annotations
 

@@ -20,6 +20,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "radio_hold.h"
+#include "ble_beacon.h"
 #include "esp_timer.h"
 #include "lwip/sockets.h"
 
@@ -96,16 +97,19 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
 
-    char response[640];
+    char response[768];
     int len = snprintf(response, sizeof(response),
         "{\"version\":\"%s\",\"date\":\"%s\",\"time\":\"%s\","
         "\"running_partition\":\"%s\",\"next_partition\":\"%s\","
-        "\"max_size\":%d,\"csi_paused\":%s,\"csi_control\":true}",
+        "\"max_size\":%d,\"csi_paused\":%s,\"csi_control\":true,"
+        "\"ble_scan\":%s,\"ble_radio\":%s,\"ble_control\":true}",
         app->version, app->date, app->time,
         running ? running->label : "unknown",
         update ? update->label : "none",
         OTA_MAX_SIZE,
-        radio_hold_is_paused() ? "true" : "false");
+        radio_hold_is_paused() ? "true" : "false",
+        ble_beacon_is_enabled() ? "true" : "false",
+        ble_beacon_radio_is_up() ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, response, len);
@@ -254,6 +258,32 @@ static esp_err_t csi_stop_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t ble_start_handler(httpd_req_t *req)
+{
+    if (!ota_check_auth(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                            "Authentication required. Use: Authorization: Bearer <psk>");
+        return ESP_FAIL;
+    }
+    (void)ble_beacon_start();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ble_scan\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t ble_stop_handler(httpd_req_t *req)
+{
+    if (!ota_check_auth(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                            "Authentication required. Use: Authorization: Bearer <psk>");
+        return ESP_FAIL;
+    }
+    (void)ble_beacon_stop();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ble_scan\":false}");
+    return ESP_OK;
+}
+
 static esp_err_t csi_start_handler(httpd_req_t *req)
 {
     if (!ota_check_auth(req)) {
@@ -321,12 +351,18 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
     register_csi_ctrl(server, HTTP_POST, "/csi/stop", csi_stop_handler);
     register_csi_ctrl(server, HTTP_GET, "/csi/start", csi_start_handler);
     register_csi_ctrl(server, HTTP_POST, "/csi/start", csi_start_handler);
+    register_csi_ctrl(server, HTTP_GET, "/ble/start", ble_start_handler);
+    register_csi_ctrl(server, HTTP_POST, "/ble/start", ble_start_handler);
+    register_csi_ctrl(server, HTTP_GET, "/ble/stop", ble_stop_handler);
+    register_csi_ctrl(server, HTTP_POST, "/ble/stop", ble_stop_handler);
 
     ESP_LOGI(TAG, "OTA HTTP server started on port %d", OTA_PORT);
-    ESP_LOGI(TAG, "  GET  /ota/status — firmware version + csi_paused");
+    ESP_LOGI(TAG, "  GET  /ota/status — firmware version + csi_paused + ble_scan");
     ESP_LOGI(TAG, "  POST /ota        — upload new firmware binary (pauses CSI)");
     ESP_LOGI(TAG, "  GET/POST /csi/stop  — pause CSI+BLE (Bearer PSK)");
     ESP_LOGI(TAG, "  GET/POST /csi/start — resume CSI+BLE (Bearer PSK)");
+    ESP_LOGI(TAG, "  GET/POST /ble/start — opt-in NimBLE slices (Bearer PSK)");
+    ESP_LOGI(TAG, "  GET/POST /ble/stop  — tear down NimBLE controller");
 
     if (out_handle) *out_handle = server;
     return ESP_OK;

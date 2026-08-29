@@ -30,17 +30,14 @@ Tonight’s OTA targets: node 1 upstairs-living `192.168.0.47`, node 2 stairs `1
 - Second dog later: Minor **4950**
 - Parse: Apple company ID `0x004C`, iBeacon type `0x02`
 
-**Coexistence (0.8.7-ble — this is the STA-alive fix):** 0.8.5/0.8.6 ran NimBLE `ble_gap_disc` for **300 ms at 100% duty** (`itvl == window`) every 2.5 s on **CPU 0** next to the Wi-Fi task, and CSI `sendto` ran *inside* the Wi-Fi/CSI callback. That wedged STA TX: `ping_sock: send error=0`, ICMP/TCP `:8032` dead, `task_wdt` on IDLE0 / CPU0 stuck in `wifi`. Green LED stayed on because `GOT_IP` had already happened.
+**0.8.8-ble radio rule (this is what keeps CPU 0 out of `wifi`):** `ble_beacon_init()` does **not** call `nimble_port_init()`. The BLE controller is not started at boot, so it cannot take the 2.4 GHz radio or block the wifi task. 0.8.5–0.8.7 all hung STA with NimBLE up (IDLE0 / CPU0 stuck in `wifi`) even after CPU pin + 16% duty + `COEX_PREFER_WIFI`.
 
-Concrete changes (point at these in code):
+- Default: BLE scan **OFF**. `GET /ble/beacons` works and reports `"enabled":false`.
+- PSK `GET/POST :8032/ble/start` opts in. Each slice: controller on → ~80 ms scan → `nimble_port_stop` + `deinit` → 8 s Wi-Fi-only.
+- PSK `/ble/stop`, Wi-Fi TX fail, or OTA hold tears the controller down and leaves it off (TX fail clears enable).
+- `GET /ota/status` includes `ble_scan`, `ble_radio`, `ble_control`.
 
-1. **`main.c`**: `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)` after STA is up.
-2. **`sdkconfig.defaults`**: NimBLE host + BLE controller **pinned to CPU 1**; Wi-Fi task stays **CPU 0**.
-3. **`ble_beacon.c`**: one **continuous** passive scan at **~16 ms RX / 100 ms** (~16% BLE). Firmware **clamps** any leftover 300/2500 Kconfig so a stale `sdkconfig` cannot restore the hang. Do **not** start/stop 300 ms 100% bursts (RF calib wedges wifi).
-4. **`ble_beacon.c`**: GAP callback never `sendto`; BLE UDP is a CPU-1 task. If Wi-Fi TX fails several times, BLE scan backs off 8 s.
-5. **`csi_collector.c`**: CSI UDP is queued and sent from `csi_udp` on CPU 1 — never `sendto` from the Wi-Fi callback.
-
-OTA pause (`POST /ota` / `/csi/stop`) is unchanged and is **not** this bug.
+OTA pause (`POST /ota` / `/csi/stop`) still pauses CSI and keeps BLE down.
 
 If NVS allow-list is unset, every iBeacon matching the Blue Charm UUID is reported.
 
@@ -84,13 +81,10 @@ After a successful build, the OTA-compatible **app image** (load address `0x2000
 
 | Path | Bytes | Notes |
 |------|------:|-------|
-| `firmware/atom-ble/release/esp32-csi-node.bin` | **831904** | Committed OTA payload (≤ 900000) |
-| `firmware/atom-ble/build/esp32-csi-node.bin` | 831904 | IDF output (not committed) |
+| `firmware/atom-ble/release/esp32-csi-node.bin` | see `release/SIZE.txt` | Committed OTA payload (≤ 900000) |
+| `firmware/atom-ble/build/esp32-csi-node.bin` | same | IDF output (not committed) |
 
-SHA-256: `64a364f9fdfa96ce10ea591c8bb50ad5c1d410c42d29089d8659f5655348f357`. Built with ESP-IDF **v5.4.2**, version string `0.8.7-ble`.
-
-- GitHub Release (private repo, needs auth): https://github.com/vetswrath/SecurityDashboard/releases/download/v0.8.7-ble/esp32-csi-node.bin
-- No-auth copy (litterbox ~72h, same SHA): https://litter.catbox.moe/hxv0g3.bin
+Version **`0.8.8-ble`**. Size and SHA-256 go in `release/SIZE.txt` after the build. GitHub Release `v0.8.8-ble` (repo is public).
 
 ### LAN OTA (0.8.6+ pause API; 0.8.7 STA-alive)
 
