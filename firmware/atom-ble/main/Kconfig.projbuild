@@ -1,0 +1,64 @@
+menu "CSI Node Configuration"
+
+    config CSI_NODE_ID
+        int "Node ID (0-255)"
+        default 1
+        range 0 255
+
+    config CSI_TARGET_IP
+        string "Aggregator IP address"
+        default "192.168.0.39"
+
+    config CSI_TARGET_PORT
+        int "Aggregator UDP port"
+        default 5005
+        range 1024 65535
+
+    config CSI_WIFI_SSID
+        string "WiFi SSID"
+        default "wifi-densepose"
+
+    config CSI_WIFI_PASSWORD
+        string "WiFi Password"
+        default ""
+
+    config CSI_WIFI_CHANNEL
+        int "WiFi Channel (1-13)"
+        default 6
+        range 1 13
+
+endmenu
+
+menu "AtomS3 Lite LED"
+
+    config LED_GPIO
+        int "WS2812 data GPIO"
+        default 35
+        range 0 48
+        help
+            AtomS3 Lite onboard SK6812/WS2812 is GPIO 35.
+
+    config LED_GREEN_LEVEL
+        int "Faint green level when online (0-255)"
+        default 8
+        range 1 64
+
+endmenu
+
+menu "BLE iBeacon scan"
+
+    config BLE_SCAN_WINDOW_MS
+        int "BLE scan window (ms)"
+        default 300
+        range 100 400
+        help
+            Short NimBLE observer window. CSI fps may dip during this window.
+
+    config BLE_SCAN_PERIOD_MS
+        int "BLE scan period (ms)"
+        default 2500
+        range 1000 5000
+        help
+            Time from the start of one scan window to the next (2–3 s).
+
+endmenu

@@ -1,0 +1,5 @@
+## AtomS3 Lite CSI + BLE — managed components
+## Display/LVGL/touch omitted (AtomS3 Lite has no panel; official 0.8.4
+## pulls them and exceeds the live 921600-byte OTA cap).
+dependencies:
+  espressif/led_strip: "^3.0.0"
