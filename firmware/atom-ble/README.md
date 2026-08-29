@@ -79,6 +79,9 @@ After a successful build, the OTA-compatible **app image** (load address `0x2000
 
 SHA-256: `c1e651025d6248753e527145f5c492151ab1396df9f800fa588e85634ca021b3` (see `release/SHA256SUMS.txt`). Built with ESP-IDF **v5.4.2**, version string `0.8.6-ble`.
 
+- GitHub Release (private repo, needs auth): https://github.com/vetswrath/SecurityDashboard/releases/download/v0.8.6-ble/esp32-csi-node.bin
+- No-auth copy (litterbox ~72h, same SHA): https://litter.catbox.moe/2qq3qk.bin
+
 ### LAN OTA (0.8.6-ble and later)
 
 Live **0.8.4** has no CSI-pause HTTP API. CSI UDP while receiving an ~828 KB `POST /ota` saturates 2.4 GHz and the upload times out (120s / 300s). USB-flash **0.8.6-ble once**. After that, later OTAs stay on LAN and should finish in about a minute.
