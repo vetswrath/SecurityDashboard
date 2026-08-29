@@ -84,10 +84,13 @@ After a successful build, the OTA-compatible **app image** (load address `0x2000
 
 | Path | Bytes | Notes |
 |------|------:|-------|
-| `firmware/atom-ble/release/esp32-csi-node.bin` | see `release/SIZE.txt` | Committed OTA payload (≤ 900000) |
-| `firmware/atom-ble/build/esp32-csi-node.bin` | same | IDF output (not committed) |
+| `firmware/atom-ble/release/esp32-csi-node.bin` | **831904** | Committed OTA payload (≤ 900000) |
+| `firmware/atom-ble/build/esp32-csi-node.bin` | 831904 | IDF output (not committed) |
 
-Version **`0.8.7-ble`**. Size and SHA-256 are in `release/SIZE.txt` after the build. ESP-IDF **v5.4.2**.
+SHA-256: `64a364f9fdfa96ce10ea591c8bb50ad5c1d410c42d29089d8659f5655348f357`. Built with ESP-IDF **v5.4.2**, version string `0.8.7-ble`.
+
+- GitHub Release (private repo, needs auth): https://github.com/vetswrath/SecurityDashboard/releases/download/v0.8.7-ble/esp32-csi-node.bin
+- No-auth copy (litterbox ~72h, same SHA): https://litter.catbox.moe/hxv0g3.bin
 
 ### LAN OTA (0.8.6+ pause API; 0.8.7 STA-alive)
 
